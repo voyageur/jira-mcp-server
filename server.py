@@ -163,6 +163,10 @@ class JiraMCPServer:
                             "comment": {
                                 "type": "string",
                                 "description": "Comment text"
+                            },
+                            "security_level": {
+                                "type": "string",
+                                "description": "Security level name or ID (optional, e.g., 'Employee', 'Internal')"
                             }
                         },
                         "required": ["issue_key", "comment"]
@@ -381,7 +385,8 @@ class JiraMCPServer:
                 elif name == "add_comment":
                     return await self._add_comment(
                         arguments["issue_key"],
-                        arguments["comment"]
+                        arguments["comment"],
+                        arguments.get("security_level")
                     )
                 elif name == "get_comments":
                     return await self._get_comments(arguments["issue_key"])
@@ -715,18 +720,64 @@ class JiraMCPServer:
         except Exception as e:
             return [TextContent(type="text", text=f"Error updating issue {issue_key}: {str(e)}")]
 
-    async def _add_comment(self, issue_key: str, comment: str) -> List[TextContent]:
+    async def _add_comment(self, issue_key: str, comment: str, security_level: Optional[str] = None) -> List[TextContent]:
         """Add a comment to an issue"""
         try:
-            issue = self.jira_client.issue(issue_key)
-            self.jira_client.add_comment(issue, comment)
-            
+            # Prepare comment data
+            comment_data = {"body": comment}
+
+            # Add security level if specified
+            if security_level:
+                # Try to find the security level by name or use it as ID directly
+                try:
+                    # Get issue metadata which includes security levels
+                    # Use the REST API endpoint to get security levels
+                    issue_meta = self.jira_client._get_json(f'issue/{issue_key}/editmeta')
+
+                    security_levels = []
+                    if 'fields' in issue_meta and 'security' in issue_meta['fields']:
+                        allowed_values = issue_meta['fields']['security'].get('allowedValues', [])
+                        security_levels = allowed_values
+
+                    # Try to find by name first
+                    security_level_id = None
+                    for level in security_levels:
+                        if level.get('name') == security_level or str(level.get('id')) == security_level:
+                            security_level_id = str(level.get('id'))
+                            break
+
+                    if security_level_id:
+                        # Add visibility to the comment data using the security level name
+                        comment_data["visibility"] = {
+                            "type": "group",
+                            "value": security_level
+                        }
+                    else:
+                        # If not found, list available levels
+                        if security_levels:
+                            available_levels = [f"{level.get('name')} (ID: {level.get('id')})" for level in security_levels]
+                            return [TextContent(type="text",
+                                   text=f"Error: Security level '{security_level}' not found.\nAvailable levels:\n" + "\n".join(available_levels))]
+                        else:
+                            return [TextContent(type="text",
+                                   text=f"Error: No security levels available for this issue or project")]
+                except Exception as e:
+                    return [TextContent(type="text", text=f"Error processing security level: {str(e)}")]
+
+            # Add the comment using the REST API directly
+            url = f'issue/{issue_key}/comment'
+            self.jira_client._session.post(
+                self.jira_client._get_url(url),
+                json=comment_data
+            )
+
+            security_text = f"\n**Security Level:** {security_level}" if security_level else ""
             text = (f"**Comment added to {issue_key} successfully!**\n\n"
-                   f"**Comment:** {comment}\n"
+                   f"**Comment:** {comment}{security_text}\n"
                    f"**URL:** {self.jira_client.server_url}/browse/{issue_key}")
-            
+
             return [TextContent(type="text", text=text)]
-            
+
         except Exception as e:
             return [TextContent(type="text", text=f"Error adding comment to {issue_key}: {str(e)}")]
 

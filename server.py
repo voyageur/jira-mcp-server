@@ -248,6 +248,33 @@ class JiraMCPServer:
                         },
                         "required": ["project_key"]
                     }
+                ),
+                Tool(
+                    name="set_sprint",
+                    description="Set the sprint for a Jira issue. Can set to current sprint, next sprint, a specific sprint by name/ID, or remove the sprint entirely.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "issue_key": {
+                                "type": "string",
+                                "description": "The Jira issue key"
+                            },
+                            "sprint_option": {
+                                "type": "string",
+                                "description": "Sprint selection option: 'current' for current active sprint, 'next' for next planned sprint, 'specific' to specify a sprint by name/ID, or 'none' to remove the sprint",
+                                "enum": ["current", "next", "specific", "none"]
+                            },
+                            "sprint_value": {
+                                "type": "string",
+                                "description": "Sprint name or ID (required only when sprint_option is 'specific')"
+                            },
+                            "board_id": {
+                                "type": "integer",
+                                "description": "Board ID to search for sprints (optional, will auto-detect if not provided)"
+                            }
+                        },
+                        "required": ["issue_key", "sprint_option"]
+                    }
                 )
             ]
 
@@ -306,6 +333,13 @@ class JiraMCPServer:
                         arguments["project_key"],
                         arguments.get("max_results", 50)
                     )
+                elif name == "set_sprint":
+                    return await self._set_sprint(
+                        arguments["issue_key"],
+                        arguments["sprint_option"],
+                        arguments.get("sprint_value"),
+                        arguments.get("board_id")
+                    )
                 else:
                     return [TextContent(type="text", text=f"Unknown tool: {name}")]
                     
@@ -339,9 +373,46 @@ class JiraMCPServer:
         try:
             if not self.jira_client:
                 return [TextContent(type="text", text="Jira client not initialized")]
-            
+
             issue = self.jira_client.issue(issue_key)
-            
+
+            # Try to find sprint information
+            sprint_info = "No sprint"
+            all_fields = self.jira_client.fields()
+            sprint_field = None
+            for field in all_fields:
+                if field.get('name', '').lower() == 'sprint':
+                    sprint_field = field['id']
+                    break
+
+            # Fallback to common sprint field IDs if not found by name
+            if not sprint_field:
+                for candidate in ['customfield_12310940', 'customfield_10020', 'customfield_10010']:
+                    if hasattr(issue.fields, candidate):
+                        sprint_field = candidate
+                        break
+
+            if sprint_field and hasattr(issue.fields, sprint_field):
+                sprint_data = getattr(issue.fields, sprint_field)
+                if sprint_data:
+                    if isinstance(sprint_data, list) and len(sprint_data) > 0:
+                        # Get the last (current) sprint
+                        sprint = sprint_data[-1]
+                        if hasattr(sprint, 'name'):
+                            sprint_info = sprint.name
+                        else:
+                            # Sprint might be a string, try to parse it
+                            sprint_str = str(sprint)
+                            # Extract name from string format: "com.atlassian.greenhopper.service.sprint.Sprint@...[name=Sprint Name,...]"
+                            if 'name=' in sprint_str:
+                                name_start = sprint_str.find('name=') + 5
+                                name_end = sprint_str.find(',', name_start)
+                                if name_end == -1:
+                                    name_end = sprint_str.find(']', name_start)
+                                sprint_info = sprint_str[name_start:name_end]
+                    elif hasattr(sprint_data, 'name'):
+                        sprint_info = sprint_data.name
+
             issue_data = {
                 "key": issue.key,
                 "summary": issue.fields.summary,
@@ -354,9 +425,10 @@ class JiraMCPServer:
                 "updated": str(issue.fields.updated),
                 "project": issue.fields.project.name,
                 "issue_type": issue.fields.issuetype.name,
+                "sprint": sprint_info,
                 "url": f"{self.jira_client.server_url}/browse/{issue.key}"
             }
-            
+
             text = (f"**Issue: {issue_data['key']}**\n\n"
                    f"**Summary:** {issue_data['summary']}\n"
                    f"**Status:** {issue_data['status']}\n"
@@ -365,13 +437,14 @@ class JiraMCPServer:
                    f"**Reporter:** {issue_data['reporter']}\n"
                    f"**Type:** {issue_data['issue_type']}\n"
                    f"**Project:** {issue_data['project']}\n"
+                   f"**Sprint:** {issue_data['sprint']}\n"
                    f"**Created:** {issue_data['created']}\n"
                    f"**Updated:** {issue_data['updated']}\n"
                    f"**URL:** {issue_data['url']}\n\n"
                    f"**Description:**\n{issue_data['description']}")
-            
+
             return [TextContent(type="text", text=text)]
-            
+
         except Exception as e:
             return [TextContent(type="text", text=f"Error fetching issue {issue_key}: {str(e)}")]
 
@@ -639,12 +712,12 @@ class JiraMCPServer:
         try:
             jql = f"project = {project_key} ORDER BY updated DESC"
             issues = self.jira_client.search_issues(jql, maxResults=max_results)
-            
+
             if not issues:
                 return [TextContent(type="text", text=f"No issues found for project {project_key}.")]
-            
+
             result_text = f"**Issues in project {project_key} ({len(issues)}):**\n\n"
-            
+
             for issue in issues:
                 result_text += (
                     f"• **{issue.key}** - {issue.fields.summary}\n"
@@ -652,11 +725,134 @@ class JiraMCPServer:
                     f"Assignee: {issue.fields.assignee.displayName if issue.fields.assignee else 'Unassigned'}\n"
                     f"  URL: {self.jira_client.server_url}/browse/{issue.key}\n\n"
                 )
-            
+
             return [TextContent(type="text", text=result_text)]
-            
+
         except Exception as e:
             return [TextContent(type="text", text=f"Error fetching project issues: {str(e)}")]
+
+    async def _set_sprint(self, issue_key: str, sprint_option: str,
+                         sprint_value: Optional[str] = None, board_id: Optional[int] = None) -> List[TextContent]:
+        """Set the sprint for a Jira issue"""
+        try:
+            issue = self.jira_client.issue(issue_key)
+
+            # Find the sprint field
+            all_fields = self.jira_client.fields()
+            sprint_field = None
+            for field in all_fields:
+                if field.get('name', '').lower() == 'sprint':
+                    sprint_field = field['id']
+                    break
+
+            # Fallback to common sprint field IDs
+            if not sprint_field:
+                for candidate in ['customfield_12310940', 'customfield_10020', 'customfield_10010']:
+                    if hasattr(issue.fields, candidate):
+                        sprint_field = candidate
+                        break
+
+            if not sprint_field:
+                return [TextContent(type="text", text=f"Error: Could not find sprint field for issue {issue_key}")]
+
+            # Handle removing sprint
+            if sprint_option == "none":
+                try:
+                    # Set sprint field to None/empty
+                    issue.update(fields={sprint_field: None})
+
+                    text = (f"**Sprint removed successfully from {issue_key}!**\n\n"
+                           f"**URL:** {self.jira_client.server_url}/browse/{issue_key}")
+
+                    return [TextContent(type="text", text=text)]
+
+                except Exception as e:
+                    return [TextContent(type="text", text=f"Error removing sprint: {str(e)}")]
+
+            # Get the board ID if not provided
+            if not board_id:
+                # Try to find the board from the issue's project
+                try:
+                    boards = self.jira_client._get_json('rest/agile/1.0/board', params={'projectKeyOrId': issue.fields.project.key})
+                    if boards.get('values'):
+                        board_id = boards['values'][0]['id']
+                    else:
+                        return [TextContent(type="text", text=f"Error: Could not find board for project {issue.fields.project.key}")]
+                except Exception as e:
+                    return [TextContent(type="text", text=f"Error finding board: {str(e)}")]
+
+            # Get sprints from the board
+            try:
+                sprints_data = self.jira_client._get_json(f'rest/agile/1.0/board/{board_id}/sprint')
+                sprints = sprints_data.get('values', [])
+            except Exception as e:
+                return [TextContent(type="text", text=f"Error fetching sprints: {str(e)}")]
+
+            if not sprints:
+                return [TextContent(type="text", text=f"Error: No sprints found for board {board_id}")]
+
+            # Select the appropriate sprint based on the option
+            selected_sprint = None
+
+            if sprint_option == "current":
+                # Find the active sprint
+                for sprint in sprints:
+                    if sprint.get('state') == 'active':
+                        selected_sprint = sprint
+                        break
+                if not selected_sprint:
+                    return [TextContent(type="text", text="Error: No active sprint found")]
+
+            elif sprint_option == "next":
+                # Find the next future sprint
+                future_sprints = [s for s in sprints if s.get('state') == 'future']
+                if future_sprints:
+                    # Sort by start date or ID and get the first one
+                    future_sprints.sort(key=lambda s: s.get('id', 0))
+                    selected_sprint = future_sprints[0]
+                else:
+                    return [TextContent(type="text", text="Error: No future sprint found")]
+
+            elif sprint_option == "specific":
+                if not sprint_value:
+                    return [TextContent(type="text", text="Error: sprint_value is required when sprint_option is 'specific'")]
+
+                # Try to find sprint by name or ID
+                for sprint in sprints:
+                    if (sprint.get('name') == sprint_value or
+                        str(sprint.get('id')) == sprint_value):
+                        selected_sprint = sprint
+                        break
+
+                if not selected_sprint:
+                    available_sprints = [f"{s.get('name')} (ID: {s.get('id')})" for s in sprints]
+                    return [TextContent(type="text",
+                           text=f"Error: Sprint '{sprint_value}' not found.\nAvailable sprints:\n" + "\n".join(available_sprints))]
+
+            if not selected_sprint:
+                return [TextContent(type="text", text="Error: Could not determine sprint to set")]
+
+            # Set the sprint using the Agile API
+            try:
+                sprint_id = selected_sprint['id']
+                self.jira_client._session.post(
+                    f"{self.jira_client.server_url}/rest/agile/1.0/sprint/{sprint_id}/issue",
+                    json={"issues": [issue_key]}
+                )
+
+                text = (f"**Sprint set successfully for {issue_key}!**\n\n"
+                       f"**Sprint:** {selected_sprint.get('name')}\n"
+                       f"**Sprint ID:** {sprint_id}\n"
+                       f"**Sprint State:** {selected_sprint.get('state')}\n"
+                       f"**URL:** {self.jira_client.server_url}/browse/{issue_key}")
+
+                return [TextContent(type="text", text=text)]
+
+            except Exception as e:
+                return [TextContent(type="text", text=f"Error setting sprint: {str(e)}")]
+
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error setting sprint for {issue_key}: {str(e)}")]
 
     async def run(self):
         """Run the MCP server"""

@@ -141,6 +141,10 @@ class JiraMCPServer:
                             "priority": {
                                 "type": "string",
                                 "description": "Priority level (e.g., Blocker, Critical, Major, Minor, Normal, Undefined)"
+                            },
+                            "assignee": {
+                                "type": "string",
+                                "description": "Assignee email, account ID, or 'me'/'myself' for current user (optional)"
                             }
                         },
                         "required": ["issue_key"]
@@ -318,7 +322,8 @@ class JiraMCPServer:
                         arguments.get("summary"),
                         arguments.get("description"),
                         arguments.get("story_points"),
-                        arguments.get("priority")
+                        arguments.get("priority"),
+                        arguments.get("assignee")
                     )
                 elif name == "add_comment":
                     return await self._add_comment(
@@ -542,7 +547,7 @@ class JiraMCPServer:
 
     async def _update_issue(self, issue_key: str, summary: Optional[str] = None,
                           description: Optional[str] = None, story_points: Optional[float] = None,
-                          priority: Optional[str] = None) -> List[TextContent]:
+                          priority: Optional[str] = None, assignee: Optional[str] = None) -> List[TextContent]:
         """Update an existing issue"""
         try:
             issue = self.jira_client.issue(issue_key)
@@ -554,6 +559,30 @@ class JiraMCPServer:
                 update_dict['description'] = description
             if priority:
                 update_dict['priority'] = {'name': priority}
+
+            # Handle assignee
+            if assignee is not None:
+                # Handle special values for current user
+                if assignee.lower() in ['me', 'myself']:
+                    # Get current user's account ID
+                    current_user = self.jira_client.current_user()
+                    update_dict['assignee'] = {'accountId': current_user}
+                elif assignee == '':
+                    # Empty string means unassign
+                    update_dict['assignee'] = None
+                elif '@' in assignee:
+                    # Treat as email - need to search for user by email
+                    try:
+                        users = self.jira_client.search_users(assignee)
+                        if users:
+                            update_dict['assignee'] = {'accountId': users[0].accountId}
+                        else:
+                            return [TextContent(type="text", text=f"Error: User with email '{assignee}' not found")]
+                    except Exception as e:
+                        return [TextContent(type="text", text=f"Error searching for user: {str(e)}")]
+                else:
+                    # Assume it's an account ID
+                    update_dict['assignee'] = {'accountId': assignee}
 
             # Handle story points - need to find the custom field ID
             if story_points is not None:
@@ -592,6 +621,13 @@ class JiraMCPServer:
                 updates.append(f"Priority: {priority}")
             if story_points is not None:
                 updates.append(f"Story points: {story_points}")
+            if assignee is not None:
+                if assignee.lower() in ['me', 'myself']:
+                    updates.append("Assignee: current user")
+                elif assignee == '':
+                    updates.append("Assignee: unassigned")
+                else:
+                    updates.append(f"Assignee: {assignee}")
 
             text = (f"**Issue {issue_key} updated successfully!**\n\n"
                    f"**Updated fields:** {', '.join(updates)}\n"
@@ -813,7 +849,7 @@ class JiraMCPServer:
             if not board_id:
                 # Try to find the board from the issue's project
                 try:
-                    boards = self.jira_client._get_json('rest/agile/1.0/board', params={'projectKeyOrId': issue.fields.project.key})
+                    boards = self.jira_client._get_json('agile/1.0/board', params={'projectKeyOrId': issue.fields.project.key})
                     if boards.get('values'):
                         board_id = boards['values'][0]['id']
                     else:
@@ -823,7 +859,7 @@ class JiraMCPServer:
 
             # Get sprints from the board
             try:
-                sprints_data = self.jira_client._get_json(f'rest/agile/1.0/board/{board_id}/sprint')
+                sprints_data = self.jira_client._get_json(f'agile/1.0/board/{board_id}/sprint')
                 sprints = sprints_data.get('values', [])
             except Exception as e:
                 return [TextContent(type="text", text=f"Error fetching sprints: {str(e)}")]

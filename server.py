@@ -129,6 +129,10 @@ class JiraMCPServer:
                             "description": {
                                 "type": "string",
                                 "description": "New description (optional)"
+                            },
+                            "story_points": {
+                                "type": "number",
+                                "description": "Story points estimate (optional)"
                             }
                         },
                         "required": ["issue_key"]
@@ -276,7 +280,8 @@ class JiraMCPServer:
                     return await self._update_issue(
                         arguments["issue_key"],
                         arguments.get("summary"),
-                        arguments.get("description")
+                        arguments.get("description"),
+                        arguments.get("story_points")
                     )
                 elif name == "add_comment":
                     return await self._add_comment(
@@ -427,35 +432,60 @@ class JiraMCPServer:
         except Exception as e:
             return [TextContent(type="text", text=f"Error creating issue: {str(e)}")]
 
-    async def _update_issue(self, issue_key: str, summary: Optional[str] = None, 
-                          description: Optional[str] = None) -> List[TextContent]:
+    async def _update_issue(self, issue_key: str, summary: Optional[str] = None,
+                          description: Optional[str] = None, story_points: Optional[float] = None) -> List[TextContent]:
         """Update an existing issue"""
         try:
             issue = self.jira_client.issue(issue_key)
             update_dict = {}
-            
+
             if summary:
                 update_dict['summary'] = summary
             if description:
                 update_dict['description'] = description
-                
+
+            # Handle story points - need to find the custom field ID
+            if story_points is not None:
+                # Try common story point field names
+                story_point_field = None
+                all_fields = self.jira_client.fields()
+                for field in all_fields:
+                    if field.get('name', '').lower() in ['story points', 'story point estimate']:
+                        story_point_field = field['id']
+                        break
+
+                # Fallback to common custom field IDs if not found by name
+                if not story_point_field:
+                    # Try the most common custom field IDs for story points
+                    for candidate in ['customfield_10016', 'customfield_10026', 'customfield_10004']:
+                        if hasattr(issue.fields, candidate):
+                            story_point_field = candidate
+                            break
+
+                if story_point_field:
+                    update_dict[story_point_field] = story_points
+                else:
+                    return [TextContent(type="text", text=f"Error: Could not find story points field for issue {issue_key}")]
+
             if not update_dict:
                 return [TextContent(type="text", text="No fields specified for update.")]
-            
+
             issue.update(fields=update_dict)
-            
+
             updates = []
             if summary:
                 updates.append(f"Summary: {summary}")
             if description:
                 updates.append("Description updated")
-                
+            if story_points is not None:
+                updates.append(f"Story points: {story_points}")
+
             text = (f"**Issue {issue_key} updated successfully!**\n\n"
                    f"**Updated fields:** {', '.join(updates)}\n"
                    f"**URL:** {self.jira_client.server_url}/browse/{issue_key}")
-            
+
             return [TextContent(type="text", text=text)]
-            
+
         except Exception as e:
             return [TextContent(type="text", text=f"Error updating issue {issue_key}: {str(e)}")]
 

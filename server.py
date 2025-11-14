@@ -287,6 +287,24 @@ class JiraMCPServer:
                         },
                         "required": ["issue_key", "sprint_option"]
                     }
+                ),
+                Tool(
+                    name="set_epic_link",
+                    description="Set or remove the epic link for a Jira issue. Links an issue to an epic or removes the epic link.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "issue_key": {
+                                "type": "string",
+                                "description": "The Jira issue key to update"
+                            },
+                            "epic_key": {
+                                "type": "string",
+                                "description": "The epic issue key to link to (e.g., PROJ-123), or null/empty string to remove the epic link"
+                            }
+                        },
+                        "required": ["issue_key"]
+                    }
                 )
             ]
 
@@ -354,6 +372,11 @@ class JiraMCPServer:
                         arguments["sprint_option"],
                         arguments.get("sprint_value"),
                         arguments.get("board_id")
+                    )
+                elif name == "set_epic_link":
+                    return await self._set_epic_link(
+                        arguments["issue_key"],
+                        arguments.get("epic_key")
                     )
                 else:
                     return [TextContent(type="text", text=f"Unknown tool: {name}")]
@@ -566,7 +589,7 @@ class JiraMCPServer:
                 if assignee.lower() in ['me', 'myself']:
                     # Get current user's account ID
                     current_user = self.jira_client.current_user()
-                    update_dict['assignee'] = {'accountId': current_user}
+                    update_dict['assignee'] = {'name': current_user}
                 elif assignee == '':
                     # Empty string means unassign
                     update_dict['assignee'] = None
@@ -575,14 +598,26 @@ class JiraMCPServer:
                     try:
                         users = self.jira_client.search_users(assignee)
                         if users:
-                            update_dict['assignee'] = {'accountId': users[0].accountId}
+                            user = users[0]
+                            # Try to get accountId first, fall back to name
+                            if hasattr(user, 'accountId'):
+                                update_dict['assignee'] = {'accountId': user.accountId}
+                            elif hasattr(user, 'name'):
+                                update_dict['assignee'] = {'name': user.name}
+                            else:
+                                # Last resort - try to use the key attribute
+                                update_dict['assignee'] = {'name': user.key if hasattr(user, 'key') else str(user)}
                         else:
                             return [TextContent(type="text", text=f"Error: User with email '{assignee}' not found")]
                     except Exception as e:
                         return [TextContent(type="text", text=f"Error searching for user: {str(e)}")]
                 else:
-                    # Assume it's an account ID
-                    update_dict['assignee'] = {'accountId': assignee}
+                    # Assume it's an account ID or username
+                    # Try accountId first, if that fails the error will indicate to use name
+                    try:
+                        update_dict['assignee'] = {'accountId': assignee}
+                    except:
+                        update_dict['assignee'] = {'name': assignee}
 
             # Handle story points - need to find the custom field ID
             if story_points is not None:
@@ -849,9 +884,9 @@ class JiraMCPServer:
             if not board_id:
                 # Try to find the board from the issue's project
                 try:
-                    boards = self.jira_client._get_json('agile/1.0/board', params={'projectKeyOrId': issue.fields.project.key})
-                    if boards.get('values'):
-                        board_id = boards['values'][0]['id']
+                    boards = self.jira_client.boards(projectKeyOrId=issue.fields.project.key)
+                    if boards:
+                        board_id = boards[0].id
                     else:
                         return [TextContent(type="text", text=f"Error: Could not find board for project {issue.fields.project.key}")]
                 except Exception as e:
@@ -859,8 +894,7 @@ class JiraMCPServer:
 
             # Get sprints from the board
             try:
-                sprints_data = self.jira_client._get_json(f'agile/1.0/board/{board_id}/sprint')
-                sprints = sprints_data.get('values', [])
+                sprints = self.jira_client.sprints(board_id)
             except Exception as e:
                 return [TextContent(type="text", text=f"Error fetching sprints: {str(e)}")]
 
@@ -873,7 +907,7 @@ class JiraMCPServer:
             if sprint_option == "current":
                 # Find the active sprint
                 for sprint in sprints:
-                    if sprint.get('state') == 'active':
+                    if sprint.state == 'active':
                         selected_sprint = sprint
                         break
                 if not selected_sprint:
@@ -881,10 +915,10 @@ class JiraMCPServer:
 
             elif sprint_option == "next":
                 # Find the next future sprint
-                future_sprints = [s for s in sprints if s.get('state') == 'future']
+                future_sprints = [s for s in sprints if s.state == 'future']
                 if future_sprints:
                     # Sort by start date or ID and get the first one
-                    future_sprints.sort(key=lambda s: s.get('id', 0))
+                    future_sprints.sort(key=lambda s: s.id)
                     selected_sprint = future_sprints[0]
                 else:
                     return [TextContent(type="text", text="Error: No future sprint found")]
@@ -895,31 +929,27 @@ class JiraMCPServer:
 
                 # Try to find sprint by name or ID
                 for sprint in sprints:
-                    if (sprint.get('name') == sprint_value or
-                        str(sprint.get('id')) == sprint_value):
+                    if (sprint.name == sprint_value or
+                        str(sprint.id) == sprint_value):
                         selected_sprint = sprint
                         break
 
                 if not selected_sprint:
-                    available_sprints = [f"{s.get('name')} (ID: {s.get('id')})" for s in sprints]
+                    available_sprints = [f"{s.name} (ID: {s.id})" for s in sprints]
                     return [TextContent(type="text",
                            text=f"Error: Sprint '{sprint_value}' not found.\nAvailable sprints:\n" + "\n".join(available_sprints))]
 
             if not selected_sprint:
                 return [TextContent(type="text", text="Error: Could not determine sprint to set")]
 
-            # Set the sprint using the Agile API
+            # Set the sprint using the Jira Python module
             try:
-                sprint_id = selected_sprint['id']
-                self.jira_client._session.post(
-                    f"{self.jira_client.server_url}/rest/agile/1.0/sprint/{sprint_id}/issue",
-                    json={"issues": [issue_key]}
-                )
+                self.jira_client.add_issues_to_sprint(selected_sprint.id, [issue_key])
 
                 text = (f"**Sprint set successfully for {issue_key}!**\n\n"
-                       f"**Sprint:** {selected_sprint.get('name')}\n"
-                       f"**Sprint ID:** {sprint_id}\n"
-                       f"**Sprint State:** {selected_sprint.get('state')}\n"
+                       f"**Sprint:** {selected_sprint.name}\n"
+                       f"**Sprint ID:** {selected_sprint.id}\n"
+                       f"**Sprint State:** {selected_sprint.state}\n"
                        f"**URL:** {self.jira_client.server_url}/browse/{issue_key}")
 
                 return [TextContent(type="text", text=text)]
@@ -929,6 +959,68 @@ class JiraMCPServer:
 
         except Exception as e:
             return [TextContent(type="text", text=f"Error setting sprint for {issue_key}: {str(e)}")]
+
+    async def _set_epic_link(self, issue_key: str, epic_key: Optional[str] = None) -> List[TextContent]:
+        """Set or remove the epic link for a Jira issue"""
+        try:
+            issue = self.jira_client.issue(issue_key)
+
+            # Find the Epic Link custom field
+            all_fields = self.jira_client.fields()
+            epic_link_field = None
+            for field in all_fields:
+                if field.get('name', '').lower() == 'epic link':
+                    epic_link_field = field['id']
+                    break
+
+            # Fallback to common epic link field IDs
+            if not epic_link_field:
+                for candidate in ['customfield_12311140', 'customfield_10014', 'customfield_10008']:
+                    # Try to find if this field exists in the issue
+                    if hasattr(issue.fields, candidate):
+                        epic_link_field = candidate
+                        break
+
+            if not epic_link_field:
+                return [TextContent(type="text", text=f"Error: Could not find Epic Link field for issue {issue_key}")]
+
+            # Handle removing epic link
+            if not epic_key or epic_key == "":
+                try:
+                    issue.update(fields={epic_link_field: None})
+
+                    text = (f"**Epic link removed successfully from {issue_key}!**\n\n"
+                           f"**URL:** {self.jira_client.server_url}/browse/{issue_key}")
+
+                    return [TextContent(type="text", text=text)]
+
+                except Exception as e:
+                    return [TextContent(type="text", text=f"Error removing epic link: {str(e)}")]
+
+            # Verify the epic exists
+            try:
+                epic = self.jira_client.issue(epic_key)
+                if epic.fields.issuetype.name.lower() != 'epic':
+                    return [TextContent(type="text", text=f"Error: {epic_key} is not an Epic (type: {epic.fields.issuetype.name})")]
+            except Exception as e:
+                return [TextContent(type="text", text=f"Error: Could not find epic {epic_key}: {str(e)}")]
+
+            # Set the epic link
+            try:
+                issue.update(fields={epic_link_field: epic_key})
+
+                text = (f"**Epic link set successfully for {issue_key}!**\n\n"
+                       f"**Epic:** {epic_key} - {epic.fields.summary}\n"
+                       f"**Issue URL:** {self.jira_client.server_url}/browse/{issue_key}\n"
+                       f"**Epic URL:** {self.jira_client.server_url}/browse/{epic_key}")
+
+                return [TextContent(type="text", text=text)]
+
+            except Exception as e:
+                return [TextContent(type="text", text=f"Error setting epic link: {str(e)}")]
+
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error setting epic link for {issue_key}: {str(e)}")]
 
     async def run(self):
         """Run the MCP server"""

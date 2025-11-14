@@ -101,8 +101,8 @@ class JiraMCPServer:
                             },
                             "priority": {
                                 "type": "string",
-                                "description": "Priority level (e.g., Blocker, Critical, Major, Minor, Undefined)",
-                                "default": "Undefined"
+                                "description": "Priority level (e.g., Blocker, Critical, Major, Minor, Normal, Undefined)",
+                                "default": "Normal"
                             },
                             "due_date": {
                                 "type": "string",
@@ -137,6 +137,10 @@ class JiraMCPServer:
                             "story_points": {
                                 "type": "number",
                                 "description": "Story points estimate (optional)"
+                            },
+                            "priority": {
+                                "type": "string",
+                                "description": "Priority level (e.g., Blocker, Critical, Major, Minor, Normal, Undefined)"
                             }
                         },
                         "required": ["issue_key"]
@@ -304,7 +308,7 @@ class JiraMCPServer:
                         arguments["issue_type"],
                         arguments["summary"],
                         arguments["description"],
-                        arguments.get("priority", "Medium"),
+                        arguments.get("priority", "Normal"),
                         arguments.get("due_date"),
                         arguments.get("epic_name")
                     )
@@ -313,7 +317,8 @@ class JiraMCPServer:
                         arguments["issue_key"],
                         arguments.get("summary"),
                         arguments.get("description"),
-                        arguments.get("story_points")
+                        arguments.get("story_points"),
+                        arguments.get("priority")
                     )
                 elif name == "add_comment":
                     return await self._add_comment(
@@ -477,7 +482,7 @@ class JiraMCPServer:
             return [TextContent(type="text", text=f"Error searching issues: {str(e)}")]
 
     async def _create_issue(self, project_key: str, issue_type: str, summary: str,
-                          description: str, priority: str = "Medium", due_date: str = None,
+                          description: str, priority: str = "Normal", due_date: str = None,
                           epic_name: str = None) -> List[TextContent]:
         """Create a new Jira issue"""
         try:
@@ -488,8 +493,8 @@ class JiraMCPServer:
                 'issuetype': {'name': issue_type},
             }
 
-            # Add priority if specified (only if not an epic or if priority is explicitly set)
-            if priority and priority != "Medium":
+            # Add priority if specified
+            if priority:
                 issue_dict['priority'] = {'name': priority}
 
             # Add due date if specified
@@ -536,7 +541,8 @@ class JiraMCPServer:
             return [TextContent(type="text", text=f"Error creating issue: {str(e)}")]
 
     async def _update_issue(self, issue_key: str, summary: Optional[str] = None,
-                          description: Optional[str] = None, story_points: Optional[float] = None) -> List[TextContent]:
+                          description: Optional[str] = None, story_points: Optional[float] = None,
+                          priority: Optional[str] = None) -> List[TextContent]:
         """Update an existing issue"""
         try:
             issue = self.jira_client.issue(issue_key)
@@ -546,6 +552,8 @@ class JiraMCPServer:
                 update_dict['summary'] = summary
             if description:
                 update_dict['description'] = description
+            if priority:
+                update_dict['priority'] = {'name': priority}
 
             # Handle story points - need to find the custom field ID
             if story_points is not None:
@@ -580,6 +588,8 @@ class JiraMCPServer:
                 updates.append(f"Summary: {summary}")
             if description:
                 updates.append("Description updated")
+            if priority:
+                updates.append(f"Priority: {priority}")
             if story_points is not None:
                 updates.append(f"Story points: {story_points}")
 

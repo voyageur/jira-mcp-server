@@ -305,6 +305,41 @@ class JiraMCPServer:
                         },
                         "required": ["issue_key"]
                     }
+                ),
+                Tool(
+                    name="get_components",
+                    description="Get available components for a project",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "project_key": {
+                                "type": "string",
+                                "description": "Project key"
+                            }
+                        },
+                        "required": ["project_key"]
+                    }
+                ),
+                Tool(
+                    name="set_components",
+                    description="Set components for a Jira issue. Replaces existing components with the provided list.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "issue_key": {
+                                "type": "string",
+                                "description": "The Jira issue key"
+                            },
+                            "components": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "description": "List of component names to set. Use empty array to remove all components."
+                            }
+                        },
+                        "required": ["issue_key", "components"]
+                    }
                 )
             ]
 
@@ -377,6 +412,13 @@ class JiraMCPServer:
                     return await self._set_epic_link(
                         arguments["issue_key"],
                         arguments.get("epic_key")
+                    )
+                elif name == "get_components":
+                    return await self._get_components(arguments["project_key"])
+                elif name == "set_components":
+                    return await self._set_components(
+                        arguments["issue_key"],
+                        arguments["components"]
                     )
                 else:
                     return [TextContent(type="text", text=f"Unknown tool: {name}")]
@@ -1021,6 +1063,71 @@ class JiraMCPServer:
 
         except Exception as e:
             return [TextContent(type="text", text=f"Error setting epic link for {issue_key}: {str(e)}")]
+
+    async def _get_components(self, project_key: str) -> List[TextContent]:
+        """Get available components for a project"""
+        try:
+            project = self.jira_client.project(project_key)
+            components = self.jira_client.project_components(project)
+
+            if not components:
+                return [TextContent(type="text", text=f"No components found for project {project_key}.")]
+
+            result_text = f"**Components for project {project_key}:**\n\n"
+
+            for component in components:
+                result_text += f"• **{component.name}**"
+                if hasattr(component, 'description') and component.description:
+                    result_text += f" - {component.description}"
+                result_text += "\n"
+
+            return [TextContent(type="text", text=result_text)]
+
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error fetching components for {project_key}: {str(e)}")]
+
+    async def _set_components(self, issue_key: str, components: List[str]) -> List[TextContent]:
+        """Set components for a Jira issue"""
+        try:
+            issue = self.jira_client.issue(issue_key)
+            project = issue.fields.project
+
+            # Get available components for validation
+            available_components = self.jira_client.project_components(project)
+            available_component_names = {comp.name: comp for comp in available_components}
+
+            # Validate that all requested components exist
+            invalid_components = []
+            valid_components = []
+
+            for comp_name in components:
+                if comp_name in available_component_names:
+                    valid_components.append({'name': comp_name})
+                else:
+                    invalid_components.append(comp_name)
+
+            if invalid_components:
+                available_list = ", ".join(available_component_names.keys())
+                return [TextContent(type="text",
+                       text=f"Error: Invalid component(s): {', '.join(invalid_components)}\n\n"
+                            f"Available components: {available_list}")]
+
+            # Update the issue with the new components
+            issue.update(fields={'components': valid_components})
+
+            if components:
+                comp_list = ", ".join(components)
+                text = (f"**Components set successfully for {issue_key}!**\n\n"
+                       f"**Components:** {comp_list}\n"
+                       f"**URL:** {self.jira_client.server_url}/browse/{issue_key}")
+            else:
+                text = (f"**All components removed from {issue_key}!**\n\n"
+                       f"**URL:** {self.jira_client.server_url}/browse/{issue_key}")
+
+            return [TextContent(type="text", text=text)]
+
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error setting components for {issue_key}: {str(e)}")]
 
     async def run(self):
         """Run the MCP server"""

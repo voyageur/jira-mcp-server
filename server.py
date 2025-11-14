@@ -89,7 +89,7 @@ class JiraMCPServer:
                             },
                             "issue_type": {
                                 "type": "string",
-                                "description": "Issue type (e.g., Task, Bug, Story)"
+                                "description": "Issue type (e.g., Task, Bug, Story, Epic)"
                             },
                             "summary": {
                                 "type": "string",
@@ -107,6 +107,10 @@ class JiraMCPServer:
                             "due_date": {
                                 "type": "string",
                                 "description": "Due date in YYYY-MM-DD format (optional)"
+                            },
+                            "epic_name": {
+                                "type": "string",
+                                "description": "Epic name (required when issue_type is Epic)"
                             }
                         },
                         "required": ["project_key", "issue_type", "summary", "description"]
@@ -301,7 +305,8 @@ class JiraMCPServer:
                         arguments["summary"],
                         arguments["description"],
                         arguments.get("priority", "Medium"),
-                        arguments.get("due_date")
+                        arguments.get("due_date"),
+                        arguments.get("epic_name")
                     )
                 elif name == "update_issue":
                     return await self._update_issue(
@@ -471,8 +476,9 @@ class JiraMCPServer:
         except Exception as e:
             return [TextContent(type="text", text=f"Error searching issues: {str(e)}")]
 
-    async def _create_issue(self, project_key: str, issue_type: str, summary: str, 
-                          description: str, priority: str = "Medium", due_date: str = None) -> List[TextContent]:
+    async def _create_issue(self, project_key: str, issue_type: str, summary: str,
+                          description: str, priority: str = "Medium", due_date: str = None,
+                          epic_name: str = None) -> List[TextContent]:
         """Create a new Jira issue"""
         try:
             issue_dict = {
@@ -481,27 +487,51 @@ class JiraMCPServer:
                 'description': description,
                 'issuetype': {'name': issue_type},
             }
-            
-            # Add priority if specified
-            if priority:
+
+            # Add priority if specified (only if not an epic or if priority is explicitly set)
+            if priority and priority != "Medium":
                 issue_dict['priority'] = {'name': priority}
-            
+
             # Add due date if specified
             if due_date:
                 issue_dict['duedate'] = due_date
-            
+
+            # Handle Epic Name for Epic issue types
+            if issue_type.lower() == 'epic':
+                # Find the Epic Name custom field
+                all_fields = self.jira_client.fields()
+                epic_name_field = None
+                for field in all_fields:
+                    if field.get('name', '').lower() == 'epic name':
+                        epic_name_field = field['id']
+                        break
+
+                # Fallback to common epic name field IDs
+                if not epic_name_field:
+                    for candidate in ['customfield_12311141', 'customfield_10011', 'customfield_10004']:
+                        # We can't easily check if the field exists without trying, so just use the first candidate
+                        epic_name_field = candidate
+                        break
+
+                # Use provided epic_name or fall back to summary
+                epic_name_value = epic_name if epic_name else summary
+
+                if epic_name_field:
+                    issue_dict[epic_name_field] = epic_name_value
+
             new_issue = self.jira_client.create_issue(fields=issue_dict)
-            
+
             due_date_text = f"\n**Due Date:** {due_date}" if due_date else ""
+            epic_name_text = f"\n**Epic Name:** {epic_name}" if issue_type.lower() == 'epic' and epic_name else ""
             text = (f"**Issue created successfully!**\n\n"
                    f"**Key:** {new_issue.key}\n"
                    f"**Summary:** {summary}\n"
-                   f"**Type:** {issue_type}\n"
+                   f"**Type:** {issue_type}{epic_name_text}\n"
                    f"**Priority:** {priority}{due_date_text}\n"
                    f"**URL:** {self.jira_client.server_url}/browse/{new_issue.key}")
-            
+
             return [TextContent(type="text", text=text)]
-            
+
         except Exception as e:
             return [TextContent(type="text", text=f"Error creating issue: {str(e)}")]
 

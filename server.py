@@ -498,6 +498,27 @@ class JiraMCPServer:
                     elif hasattr(sprint_data, 'name'):
                         sprint_info = sprint_data.name
 
+            # Try to find epic link information
+            epic_link_info = "No epic link"
+            epic_link_field = None
+            for field in all_fields:
+                if field.get('name', '').lower() == 'epic link':
+                    epic_link_field = field['id']
+                    break
+
+            # Fallback to common epic link field IDs if not found by name
+            if not epic_link_field:
+                for candidate in ['customfield_12311140', 'customfield_10014', 'customfield_10008']:
+                    if hasattr(issue.fields, candidate):
+                        epic_link_field = candidate
+                        break
+
+            if epic_link_field and hasattr(issue.fields, epic_link_field):
+                epic_link_data = getattr(issue.fields, epic_link_field)
+                if epic_link_data:
+                    # Epic link is typically just the epic key (e.g., "PROJ-123")
+                    epic_link_info = str(epic_link_data)
+
             issue_data = {
                 "key": issue.key,
                 "summary": issue.fields.summary,
@@ -511,6 +532,7 @@ class JiraMCPServer:
                 "project": issue.fields.project.name,
                 "issue_type": issue.fields.issuetype.name,
                 "sprint": sprint_info,
+                "epic_link": epic_link_info,
                 "url": f"{self.jira_client.server_url}/browse/{issue.key}"
             }
 
@@ -523,6 +545,7 @@ class JiraMCPServer:
                    f"**Type:** {issue_data['issue_type']}\n"
                    f"**Project:** {issue_data['project']}\n"
                    f"**Sprint:** {issue_data['sprint']}\n"
+                   f"**Epic Link:** {issue_data['epic_link']}\n"
                    f"**Created:** {issue_data['created']}\n"
                    f"**Updated:** {issue_data['updated']}\n"
                    f"**URL:** {issue_data['url']}\n\n"

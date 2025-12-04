@@ -145,6 +145,10 @@ class JiraMCPServer:
                             "assignee": {
                                 "type": "string",
                                 "description": "Assignee email, account ID, or 'me'/'myself' for current user (optional)"
+                            },
+                            "security_level": {
+                                "type": "string",
+                                "description": "Security level name or ID (optional, e.g., 'Red Hat Employee', 'Team'). Use empty string to remove security level."
                             }
                         },
                         "required": ["issue_key"]
@@ -380,7 +384,8 @@ class JiraMCPServer:
                         arguments.get("description"),
                         arguments.get("story_points"),
                         arguments.get("priority"),
-                        arguments.get("assignee")
+                        arguments.get("assignee"),
+                        arguments.get("security_level")
                     )
                 elif name == "add_comment":
                     return await self._add_comment(
@@ -519,6 +524,11 @@ class JiraMCPServer:
                     # Epic link is typically just the epic key (e.g., "PROJ-123")
                     epic_link_info = str(epic_link_data)
 
+            # Get security level information
+            security_level_info = "Public (no security level)"
+            if hasattr(issue.fields, 'security') and issue.fields.security:
+                security_level_info = issue.fields.security.name
+
             issue_data = {
                 "key": issue.key,
                 "summary": issue.fields.summary,
@@ -533,6 +543,7 @@ class JiraMCPServer:
                 "issue_type": issue.fields.issuetype.name,
                 "sprint": sprint_info,
                 "epic_link": epic_link_info,
+                "security_level": security_level_info,
                 "url": f"{self.jira_client.server_url}/browse/{issue.key}"
             }
 
@@ -546,6 +557,7 @@ class JiraMCPServer:
                    f"**Project:** {issue_data['project']}\n"
                    f"**Sprint:** {issue_data['sprint']}\n"
                    f"**Epic Link:** {issue_data['epic_link']}\n"
+                   f"**Security Level:** {issue_data['security_level']}\n"
                    f"**Created:** {issue_data['created']}\n"
                    f"**Updated:** {issue_data['updated']}\n"
                    f"**URL:** {issue_data['url']}\n\n"
@@ -640,7 +652,8 @@ class JiraMCPServer:
 
     async def _update_issue(self, issue_key: str, summary: Optional[str] = None,
                           description: Optional[str] = None, story_points: Optional[float] = None,
-                          priority: Optional[str] = None, assignee: Optional[str] = None) -> List[TextContent]:
+                          priority: Optional[str] = None, assignee: Optional[str] = None,
+                          security_level: Optional[str] = None) -> List[TextContent]:
         """Update an existing issue"""
         try:
             issue = self.jira_client.issue(issue_key)
@@ -712,6 +725,44 @@ class JiraMCPServer:
                 else:
                     return [TextContent(type="text", text=f"Error: Could not find story points field for issue {issue_key}")]
 
+            # Handle security level
+            if security_level is not None:
+                if security_level == '':
+                    # Empty string means remove security level
+                    update_dict['security'] = None
+                else:
+                    # Try to find the security level by name or use it as ID directly
+                    try:
+                        # Get issue metadata which includes security levels
+                        issue_meta = self.jira_client._get_json(f'issue/{issue_key}/editmeta')
+
+                        security_levels = []
+                        if 'fields' in issue_meta and 'security' in issue_meta['fields']:
+                            allowed_values = issue_meta['fields']['security'].get('allowedValues', [])
+                            security_levels = allowed_values
+
+                        # Try to find by name first
+                        security_level_id = None
+                        for level in security_levels:
+                            if level.get('name') == security_level or str(level.get('id')) == security_level:
+                                security_level_id = str(level.get('id'))
+                                break
+
+                        if security_level_id:
+                            # Set the security level using the ID
+                            update_dict['security'] = {'id': security_level_id}
+                        else:
+                            # If not found, list available levels
+                            if security_levels:
+                                available_levels = [f"{level.get('name')} (ID: {level.get('id')})" for level in security_levels]
+                                return [TextContent(type="text",
+                                       text=f"Error: Security level '{security_level}' not found.\nAvailable levels:\n" + "\n".join(available_levels))]
+                            else:
+                                return [TextContent(type="text",
+                                       text=f"Error: No security levels available for this issue or project")]
+                    except Exception as e:
+                        return [TextContent(type="text", text=f"Error processing security level: {str(e)}")]
+
             if not update_dict:
                 return [TextContent(type="text", text="No fields specified for update.")]
 
@@ -733,6 +784,11 @@ class JiraMCPServer:
                     updates.append("Assignee: unassigned")
                 else:
                     updates.append(f"Assignee: {assignee}")
+            if security_level is not None:
+                if security_level == '':
+                    updates.append("Security level: removed")
+                else:
+                    updates.append(f"Security level: {security_level}")
 
             text = (f"**Issue {issue_key} updated successfully!**\n\n"
                    f"**Updated fields:** {', '.join(updates)}\n"

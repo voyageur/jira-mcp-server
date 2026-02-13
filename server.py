@@ -529,6 +529,26 @@ class JiraMCPServer:
             if hasattr(issue.fields, 'security') and issue.fields.security:
                 security_level_info = issue.fields.security.name
 
+            # Try to find story points information
+            story_points_info = None
+            story_point_field = None
+            for field in all_fields:
+                if field.get('name', '').lower() in ['story points', 'story point estimate']:
+                    story_point_field = field['id']
+                    break
+
+            # Fallback to common story point field IDs if not found by name
+            if not story_point_field:
+                for candidate in ['customfield_10016', 'customfield_10026', 'customfield_10004']:
+                    if hasattr(issue.fields, candidate):
+                        story_point_field = candidate
+                        break
+
+            if story_point_field and hasattr(issue.fields, story_point_field):
+                story_points_data = getattr(issue.fields, story_point_field)
+                if story_points_data is not None:
+                    story_points_info = story_points_data
+
             issue_data = {
                 "key": issue.key,
                 "summary": issue.fields.summary,
@@ -544,8 +564,14 @@ class JiraMCPServer:
                 "sprint": sprint_info,
                 "epic_link": epic_link_info,
                 "security_level": security_level_info,
+                "story_points": story_points_info,
                 "url": f"{self.jira_client.server_url}/browse/{issue.key}"
             }
+
+            # Build story points line - only show if set
+            story_points_line = ""
+            if issue_data['story_points'] is not None:
+                story_points_line = f"**Story Points:** {issue_data['story_points']}\n"
 
             text = (f"**Issue: {issue_data['key']}**\n\n"
                    f"**Summary:** {issue_data['summary']}\n"
@@ -557,6 +583,7 @@ class JiraMCPServer:
                    f"**Project:** {issue_data['project']}\n"
                    f"**Sprint:** {issue_data['sprint']}\n"
                    f"**Epic Link:** {issue_data['epic_link']}\n"
+                   f"{story_points_line}"
                    f"**Security Level:** {issue_data['security_level']}\n"
                    f"**Created:** {issue_data['created']}\n"
                    f"**Updated:** {issue_data['updated']}\n"

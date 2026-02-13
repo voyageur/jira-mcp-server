@@ -348,6 +348,38 @@ class JiraMCPServer:
                         },
                         "required": ["issue_key", "components"]
                     }
+                ),
+                Tool(
+                    name="get_issue_sprint_history",
+                    description="Get the history of sprint changes for an issue. Shows when the issue was added to or removed from sprints.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "issue_key": {
+                                "type": "string",
+                                "description": "The Jira issue key (e.g., PROJ-123)"
+                            }
+                        },
+                        "required": ["issue_key"]
+                    }
+                ),
+                Tool(
+                    name="analyze_sprint_scope",
+                    description="Analyze a sprint to identify which issues were planned vs added mid-sprint (scope creep).",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "sprint_name": {
+                                "type": "string",
+                                "description": "The sprint name to analyze"
+                            },
+                            "board_id": {
+                                "type": "integer",
+                                "description": "Board ID (optional, will auto-detect if not provided)"
+                            }
+                        },
+                        "required": ["sprint_name"]
+                    }
                 )
             ]
 
@@ -429,6 +461,13 @@ class JiraMCPServer:
                     return await self._set_components(
                         arguments["issue_key"],
                         arguments["components"]
+                    )
+                elif name == "get_issue_sprint_history":
+                    return await self._get_issue_sprint_history(arguments["issue_key"])
+                elif name == "analyze_sprint_scope":
+                    return await self._analyze_sprint_scope(
+                        arguments["sprint_name"],
+                        arguments.get("board_id")
                     )
                 else:
                     return [TextContent(type="text", text=f"Unknown tool: {name}")]
@@ -1285,6 +1324,244 @@ class JiraMCPServer:
 
         except Exception as e:
             return [TextContent(type="text", text=f"Error setting components for {issue_key}: {str(e)}")]
+
+    async def _get_issue_sprint_history(self, issue_key: str) -> List[TextContent]:
+        """Get the history of sprint changes for an issue"""
+        try:
+            if not self.jira_client:
+                return [TextContent(type="text", text="Jira client not initialized")]
+
+            # Fetch issue with changelog expanded
+            issue = self.jira_client.issue(issue_key, expand='changelog')
+
+            sprint_changes = []
+
+            # Iterate through changelog histories
+            if hasattr(issue, 'changelog') and hasattr(issue.changelog, 'histories'):
+                for history in issue.changelog.histories:
+                    created = history.created
+                    author = history.author.displayName if hasattr(history.author, 'displayName') else 'Unknown'
+
+                    for item in history.items:
+                        if item.field == 'Sprint':
+                            from_sprint = item.fromString if item.fromString else None
+                            to_sprint = item.toString if item.toString else None
+
+                            sprint_changes.append({
+                                'timestamp': created,
+                                'author': author,
+                                'from_sprint': from_sprint,
+                                'to_sprint': to_sprint
+                            })
+
+            if not sprint_changes:
+                return [TextContent(type="text", text=f"**Sprint History for {issue_key}**\n\nNo sprint changes found in the issue history.")]
+
+            # Format output
+            result_text = f"**Sprint History for {issue_key}**\n\n"
+
+            for i, change in enumerate(sprint_changes, 1):
+                timestamp = change['timestamp']
+                author = change['author']
+                from_sprint = change['from_sprint']
+                to_sprint = change['to_sprint']
+
+                if from_sprint and to_sprint:
+                    action = f"Moved from \"{from_sprint}\" to \"{to_sprint}\""
+                elif to_sprint:
+                    action = f"Added to \"{to_sprint}\""
+                elif from_sprint:
+                    action = f"Removed from \"{from_sprint}\""
+                else:
+                    action = "Sprint changed (unknown)"
+
+                result_text += f"{i}. **{timestamp}** - {action}\n   By: {author}\n\n"
+
+            return [TextContent(type="text", text=result_text)]
+
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error fetching sprint history for {issue_key}: {str(e)}")]
+
+    async def _analyze_sprint_scope(self, sprint_name: str, board_id: Optional[int] = None) -> List[TextContent]:
+        """Analyze a sprint to identify which issues were planned vs added mid-sprint"""
+        try:
+            if not self.jira_client:
+                return [TextContent(type="text", text="Jira client not initialized")]
+
+            # Find the sprint by name
+            target_sprint = None
+
+            if board_id:
+                # Use provided board ID
+                try:
+                    sprints = self.jira_client.sprints(board_id)
+                    for sprint in sprints:
+                        if sprint.name == sprint_name:
+                            target_sprint = sprint
+                            break
+                except Exception as e:
+                    return [TextContent(type="text", text=f"Error fetching sprints from board {board_id}: {str(e)}")]
+            else:
+                # Try to find the sprint across all boards
+                try:
+                    boards = self.jira_client.boards()
+                    for board in boards:
+                        try:
+                            sprints = self.jira_client.sprints(board.id)
+                            for sprint in sprints:
+                                if sprint.name == sprint_name:
+                                    target_sprint = sprint
+                                    board_id = board.id
+                                    break
+                            if target_sprint:
+                                break
+                        except:
+                            continue
+                except Exception as e:
+                    return [TextContent(type="text", text=f"Error searching for sprint: {str(e)}")]
+
+            if not target_sprint:
+                return [TextContent(type="text", text=f"Error: Sprint '{sprint_name}' not found")]
+
+            # Get sprint details
+            sprint_start = getattr(target_sprint, 'startDate', None)
+            sprint_end = getattr(target_sprint, 'endDate', None)
+            sprint_state = getattr(target_sprint, 'state', 'unknown')
+
+            if not sprint_start:
+                return [TextContent(type="text", text=f"Error: Sprint '{sprint_name}' has no start date (may not have been started yet)")]
+
+            # Parse sprint start date
+            from datetime import datetime
+            # Handle various date formats
+            sprint_start_str = str(sprint_start)
+            try:
+                # Try ISO format with timezone
+                if 'T' in sprint_start_str:
+                    sprint_start_dt = datetime.fromisoformat(sprint_start_str.replace('Z', '+00:00'))
+                else:
+                    sprint_start_dt = datetime.strptime(sprint_start_str[:10], '%Y-%m-%d')
+            except:
+                sprint_start_dt = None
+
+            # Search for all issues in the sprint
+            jql = f'sprint = "{sprint_name}"'
+            try:
+                issues = self.jira_client.search_issues(jql, maxResults=200, expand='changelog')
+            except Exception as e:
+                return [TextContent(type="text", text=f"Error searching sprint issues: {str(e)}")]
+
+            if not issues:
+                return [TextContent(type="text", text=f"No issues found in sprint '{sprint_name}'")]
+
+            # Find the story points field
+            all_fields = self.jira_client.fields()
+            story_point_field = None
+            for field in all_fields:
+                if field.get('name', '').lower() in ['story points', 'story point estimate']:
+                    story_point_field = field['id']
+                    break
+
+            if not story_point_field:
+                for candidate in ['customfield_10016', 'customfield_10026', 'customfield_10004']:
+                    story_point_field = candidate
+                    break
+
+            # Analyze each issue
+            planned_issues = []
+            mid_sprint_issues = []
+
+            for issue in issues:
+                # Get story points
+                story_points = None
+                if story_point_field and hasattr(issue.fields, story_point_field):
+                    story_points = getattr(issue.fields, story_point_field)
+
+                # Find when this issue was added to this sprint
+                added_to_sprint_date = None
+                added_to_sprint_str = None
+
+                if hasattr(issue, 'changelog') and hasattr(issue.changelog, 'histories'):
+                    for history in issue.changelog.histories:
+                        for item in history.items:
+                            if item.field == 'Sprint':
+                                to_sprint = item.toString if item.toString else ''
+                                # Check if this sprint was added (could be multiple sprints in the string)
+                                if sprint_name in to_sprint:
+                                    added_to_sprint_str = history.created
+                                    try:
+                                        if 'T' in added_to_sprint_str:
+                                            added_to_sprint_date = datetime.fromisoformat(
+                                                added_to_sprint_str.replace('Z', '+00:00'))
+                                        else:
+                                            added_to_sprint_date = datetime.strptime(
+                                                added_to_sprint_str[:10], '%Y-%m-%d')
+                                    except:
+                                        pass
+                                    break
+                        if added_to_sprint_date:
+                            break
+
+                issue_info = {
+                    'key': issue.key,
+                    'summary': issue.fields.summary[:50] + '...' if len(issue.fields.summary) > 50 else issue.fields.summary,
+                    'story_points': story_points,
+                    'added_date': added_to_sprint_str,
+                    'added_dt': added_to_sprint_date
+                }
+
+                # Categorize as planned or mid-sprint
+                if sprint_start_dt and added_to_sprint_date:
+                    # Compare dates (make both offset-naive if needed)
+                    try:
+                        sprint_start_naive = sprint_start_dt.replace(tzinfo=None) if sprint_start_dt.tzinfo else sprint_start_dt
+                        added_naive = added_to_sprint_date.replace(tzinfo=None) if added_to_sprint_date.tzinfo else added_to_sprint_date
+
+                        if added_naive <= sprint_start_naive:
+                            planned_issues.append(issue_info)
+                        else:
+                            mid_sprint_issues.append(issue_info)
+                    except:
+                        # If comparison fails, default to planned
+                        planned_issues.append(issue_info)
+                elif not added_to_sprint_date:
+                    # If no changelog entry found, it might have been added at creation or before tracking
+                    planned_issues.append(issue_info)
+                else:
+                    planned_issues.append(issue_info)
+
+            # Calculate totals
+            planned_sp = sum(i['story_points'] or 0 for i in planned_issues)
+            mid_sprint_sp = sum(i['story_points'] or 0 for i in mid_sprint_issues)
+
+            # Format output
+            result_text = f"**Sprint Scope Analysis: {sprint_name}**\n\n"
+            result_text += f"**Sprint Start:** {sprint_start_str[:10] if sprint_start else 'Unknown'}\n"
+            result_text += f"**Sprint End:** {str(sprint_end)[:10] if sprint_end else 'Unknown'}\n"
+            result_text += f"**State:** {sprint_state}\n\n"
+
+            result_text += f"**Planned Issues ({len(planned_issues)}):** {planned_sp} SP\n"
+            result_text += "Issues added before or at sprint start\n\n"
+
+            result_text += f"**Added Mid-Sprint ({len(mid_sprint_issues)}):** {mid_sprint_sp} SP\n"
+            result_text += "Issues added after sprint started (scope creep)\n\n"
+
+            if mid_sprint_issues:
+                result_text += "| Issue | Added Date | SP | Summary |\n"
+                result_text += "|-------|------------|----|---------|\n"
+
+                # Sort by added date
+                mid_sprint_issues.sort(key=lambda x: x['added_date'] or '')
+
+                for issue_info in mid_sprint_issues:
+                    added_date = issue_info['added_date'][:10] if issue_info['added_date'] else 'Unknown'
+                    sp = issue_info['story_points'] if issue_info['story_points'] else '-'
+                    result_text += f"| {issue_info['key']} | {added_date} | {sp} | {issue_info['summary']} |\n"
+
+            return [TextContent(type="text", text=result_text)]
+
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error analyzing sprint scope: {str(e)}")]
 
     async def run(self):
         """Run the MCP server"""

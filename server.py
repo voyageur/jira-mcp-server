@@ -365,7 +365,7 @@ class JiraMCPServer:
                 ),
                 Tool(
                     name="analyze_sprint_scope",
-                    description="Analyze a sprint to identify which issues were planned vs added mid-sprint (scope creep).",
+                    description="Analyze a sprint to identify planned vs added issues, punted issues, and calculate predictability. Uses Jira's sprint report API for accurate data including removed/punted issues.",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -1383,7 +1383,7 @@ class JiraMCPServer:
             return [TextContent(type="text", text=f"Error fetching sprint history for {issue_key}: {str(e)}")]
 
     async def _analyze_sprint_scope(self, sprint_name: str, board_id: Optional[int] = None) -> List[TextContent]:
-        """Analyze a sprint to identify which issues were planned vs added mid-sprint"""
+        """Analyze a sprint using the sprint report API to identify planned vs added issues, punted issues, and calculate predictability"""
         try:
             if not self.jira_client:
                 return [TextContent(type="text", text="Jira client not initialized")]
@@ -1424,6 +1424,7 @@ class JiraMCPServer:
                 return [TextContent(type="text", text=f"Error: Sprint '{sprint_name}' not found")]
 
             # Get sprint details
+            sprint_id = target_sprint.id
             sprint_start = getattr(target_sprint, 'startDate', None)
             sprint_end = getattr(target_sprint, 'endDate', None)
             sprint_state = getattr(target_sprint, 'state', 'unknown')
@@ -1431,132 +1432,133 @@ class JiraMCPServer:
             if not sprint_start:
                 return [TextContent(type="text", text=f"Error: Sprint '{sprint_name}' has no start date (may not have been started yet)")]
 
-            # Parse sprint start date
-            from datetime import datetime
-            # Handle various date formats
-            sprint_start_str = str(sprint_start)
+            # Call the sprint report API
+            report_url = f"{self.jira_client.server_url}/rest/greenhopper/1.0/rapid/charts/sprintreport?rapidViewId={board_id}&sprintId={sprint_id}"
             try:
-                # Try ISO format with timezone
-                if 'T' in sprint_start_str:
-                    sprint_start_dt = datetime.fromisoformat(sprint_start_str.replace('Z', '+00:00'))
-                else:
-                    sprint_start_dt = datetime.strptime(sprint_start_str[:10], '%Y-%m-%d')
-            except:
-                sprint_start_dt = None
-
-            # Search for all issues in the sprint
-            jql = f'sprint = "{sprint_name}"'
-            try:
-                issues = self.jira_client.search_issues(jql, maxResults=200, expand='changelog')
+                response = self.jira_client._session.get(report_url)
+                response.raise_for_status()
+                report = response.json()
             except Exception as e:
-                return [TextContent(type="text", text=f"Error searching sprint issues: {str(e)}")]
+                return [TextContent(type="text", text=f"Error fetching sprint report: {str(e)}")]
 
-            if not issues:
-                return [TextContent(type="text", text=f"No issues found in sprint '{sprint_name}'")]
+            contents = report.get('contents', {})
 
-            # Find the story points field
-            all_fields = self.jira_client.fields()
-            story_point_field = None
-            for field in all_fields:
-                if field.get('name', '').lower() in ['story points', 'story point estimate']:
-                    story_point_field = field['id']
-                    break
+            # Get the set of issue keys added during sprint
+            added_keys = set(contents.get('issueKeysAddedDuringSprint', {}).keys())
 
-            if not story_point_field:
-                for candidate in ['customfield_10016', 'customfield_10026', 'customfield_10004']:
-                    story_point_field = candidate
-                    break
+            def get_sp(issue_data):
+                """Extract story points from sprint report issue data"""
+                stat = issue_data.get('currentEstimateStatistic', {})
+                val = stat.get('statFieldValue', {})
+                return val.get('value', 0) or 0
 
-            # Analyze each issue
-            planned_issues = []
-            mid_sprint_issues = []
-
-            for issue in issues:
-                # Get story points
-                story_points = None
-                if story_point_field and hasattr(issue.fields, story_point_field):
-                    story_points = getattr(issue.fields, story_point_field)
-
-                # Find when this issue was added to this sprint
-                added_to_sprint_date = None
-                added_to_sprint_str = None
-
-                if hasattr(issue, 'changelog') and hasattr(issue.changelog, 'histories'):
-                    for history in issue.changelog.histories:
-                        for item in history.items:
-                            if item.field == 'Sprint':
-                                to_sprint = item.toString if item.toString else ''
-                                # Check if this sprint was added (could be multiple sprints in the string)
-                                if sprint_name in to_sprint:
-                                    added_to_sprint_str = history.created
-                                    try:
-                                        if 'T' in added_to_sprint_str:
-                                            added_to_sprint_date = datetime.fromisoformat(
-                                                added_to_sprint_str.replace('Z', '+00:00'))
-                                        else:
-                                            added_to_sprint_date = datetime.strptime(
-                                                added_to_sprint_str[:10], '%Y-%m-%d')
-                                    except:
-                                        pass
-                                    break
-                        if added_to_sprint_date:
-                            break
-
-                issue_info = {
-                    'key': issue.key,
-                    'summary': issue.fields.summary[:50] + '...' if len(issue.fields.summary) > 50 else issue.fields.summary,
-                    'story_points': story_points,
-                    'added_date': added_to_sprint_str,
-                    'added_dt': added_to_sprint_date
+            def get_issue_info(issue_data):
+                """Extract issue info from sprint report issue data"""
+                key = issue_data.get('key', '')
+                summary = issue_data.get('summary', '')
+                if len(summary) > 60:
+                    summary = summary[:57] + '...'
+                sp = get_sp(issue_data)
+                status = issue_data.get('status', {}).get('name', '')
+                is_added = key in added_keys
+                return {
+                    'key': key,
+                    'summary': summary,
+                    'sp': sp,
+                    'status': status,
+                    'is_added': is_added,
                 }
 
-                # Categorize as planned or mid-sprint
-                if sprint_start_dt and added_to_sprint_date:
-                    # Compare dates (make both offset-naive if needed)
-                    try:
-                        sprint_start_naive = sprint_start_dt.replace(tzinfo=None) if sprint_start_dt.tzinfo else sprint_start_dt
-                        added_naive = added_to_sprint_date.replace(tzinfo=None) if added_to_sprint_date.tzinfo else added_to_sprint_date
+            # Categorize issues from the report
+            completed_issues = [get_issue_info(i) for i in contents.get('completedIssues', [])]
+            not_completed_issues = [get_issue_info(i) for i in contents.get('issuesNotCompletedInCurrentSprint', [])]
+            punted_issues = [get_issue_info(i) for i in contents.get('puntedIssues', [])]
+            completed_elsewhere = [get_issue_info(i) for i in contents.get('issuesCompletedInAnotherSprint', [])]
 
-                        if added_naive <= sprint_start_naive:
-                            planned_issues.append(issue_info)
-                        else:
-                            mid_sprint_issues.append(issue_info)
-                    except:
-                        # If comparison fails, default to planned
-                        planned_issues.append(issue_info)
-                elif not added_to_sprint_date:
-                    # If no changelog entry found, it might have been added at creation or before tracking
-                    planned_issues.append(issue_info)
-                else:
-                    planned_issues.append(issue_info)
+            # Split each category into planned vs added
+            completed_planned = [i for i in completed_issues if not i['is_added']]
+            completed_added = [i for i in completed_issues if i['is_added']]
+            not_completed_planned = [i for i in not_completed_issues if not i['is_added']]
+            not_completed_added = [i for i in not_completed_issues if i['is_added']]
+            punted_planned = [i for i in punted_issues if not i['is_added']]
+            punted_added = [i for i in punted_issues if i['is_added']]
+            elsewhere_planned = [i for i in completed_elsewhere if not i['is_added']]
+            elsewhere_added = [i for i in completed_elsewhere if i['is_added']]
 
-            # Calculate totals
-            planned_sp = sum(i['story_points'] or 0 for i in planned_issues)
-            mid_sprint_sp = sum(i['story_points'] or 0 for i in mid_sprint_issues)
+            # Calculate SP totals
+            completed_planned_sp = sum(i['sp'] for i in completed_planned)
+            completed_added_sp = sum(i['sp'] for i in completed_added)
+            not_completed_planned_sp = sum(i['sp'] for i in not_completed_planned)
+            not_completed_added_sp = sum(i['sp'] for i in not_completed_added)
+            punted_planned_sp = sum(i['sp'] for i in punted_planned)
+            punted_added_sp = sum(i['sp'] for i in punted_added)
+            elsewhere_planned_sp = sum(i['sp'] for i in elsewhere_planned)
+            elsewhere_added_sp = sum(i['sp'] for i in elsewhere_added)
+
+            total_planned_sp = completed_planned_sp + not_completed_planned_sp + punted_planned_sp + elsewhere_planned_sp
+            total_added_sp = completed_added_sp + not_completed_added_sp + punted_added_sp + elsewhere_added_sp
+
+            all_planned = completed_planned + not_completed_planned + punted_planned + elsewhere_planned
+            all_added = completed_added + not_completed_added + punted_added + elsewhere_added
+
+            # Calculate predictability
+            # Include issues completed in another sprint as "done" planned work
+            done_planned_sp = completed_planned_sp + elsewhere_planned_sp
+            total_denominator = total_planned_sp + total_added_sp
+            if total_denominator > 0:
+                predictability = (done_planned_sp / total_denominator) * 100
+            else:
+                predictability = 0.0
 
             # Format output
+            sprint_start_str = str(sprint_start)[:10] if sprint_start else 'Unknown'
+            sprint_end_str = str(sprint_end)[:10] if sprint_end else 'Unknown'
+
             result_text = f"**Sprint Scope Analysis: {sprint_name}**\n\n"
-            result_text += f"**Sprint Start:** {sprint_start_str[:10] if sprint_start else 'Unknown'}\n"
-            result_text += f"**Sprint End:** {str(sprint_end)[:10] if sprint_end else 'Unknown'}\n"
+            result_text += f"**Sprint Start:** {sprint_start_str}\n"
+            result_text += f"**Sprint End:** {sprint_end_str}\n"
             result_text += f"**State:** {sprint_state}\n\n"
 
-            result_text += f"**Planned Issues ({len(planned_issues)}):** {planned_sp} SP\n"
-            result_text += "Issues added before or at sprint start\n\n"
+            result_text += f"**Predictability: {predictability:.1f}%**\n"
+            result_text += f"Formula: Completed Planned SP ({done_planned_sp}) / (All Committed SP ({total_planned_sp}) + All Added SP ({total_added_sp}))\n\n"
 
-            result_text += f"**Added Mid-Sprint ({len(mid_sprint_issues)}):** {mid_sprint_sp} SP\n"
-            result_text += "Issues added after sprint started (scope creep)\n\n"
+            result_text += f"**Planned Issues ({len(all_planned)}):** {total_planned_sp} SP (committed at sprint start)\n"
+            result_text += f"  - Completed: {completed_planned_sp} SP ({len(completed_planned)} issues)\n"
+            result_text += f"  - Not Completed: {not_completed_planned_sp} SP ({len(not_completed_planned)} issues)\n"
+            result_text += f"  - Punted/Removed: {punted_planned_sp} SP ({len(punted_planned)} issues)\n"
+            if elsewhere_planned:
+                result_text += f"  - Completed in Another Sprint: {elsewhere_planned_sp} SP ({len(elsewhere_planned)} issues)\n"
+            result_text += "\n"
 
-            if mid_sprint_issues:
-                result_text += "| Issue | Added Date | SP | Summary |\n"
-                result_text += "|-------|------------|----|---------|\n"
+            result_text += f"**Added Mid-Sprint ({len(all_added)}):** {total_added_sp} SP (scope creep)\n"
+            result_text += f"  - Completed: {completed_added_sp} SP ({len(completed_added)} issues)\n"
+            result_text += f"  - Not Completed: {not_completed_added_sp} SP ({len(not_completed_added)} issues)\n"
+            if punted_added:
+                result_text += f"  - Punted/Removed: {punted_added_sp} SP ({len(punted_added)} issues)\n"
+            if elsewhere_added:
+                result_text += f"  - Completed in Another Sprint: {elsewhere_added_sp} SP ({len(elsewhere_added)} issues)\n"
+            result_text += "\n"
 
-                # Sort by added date
-                mid_sprint_issues.sort(key=lambda x: x['added_date'] or '')
+            # Punted issues table
+            all_punted = punted_planned + punted_added
+            if all_punted:
+                result_text += "**Punted Issues:**\n\n"
+                result_text += "| Issue | SP | Summary |\n"
+                result_text += "|-------|----|---------|\n"
+                for issue_info in all_punted:
+                    sp = issue_info['sp'] if issue_info['sp'] else '-'
+                    result_text += f"| {issue_info['key']} | {sp} | {issue_info['summary']} |\n"
+                result_text += "\n"
 
-                for issue_info in mid_sprint_issues:
-                    added_date = issue_info['added_date'][:10] if issue_info['added_date'] else 'Unknown'
-                    sp = issue_info['story_points'] if issue_info['story_points'] else '-'
-                    result_text += f"| {issue_info['key']} | {added_date} | {sp} | {issue_info['summary']} |\n"
+            # Added mid-sprint issues table
+            if all_added:
+                result_text += "**Added Mid-Sprint Issues:**\n\n"
+                result_text += "| Issue | SP | Status | Summary |\n"
+                result_text += "|-------|----|---------|---------|\n"
+                for issue_info in all_added:
+                    sp = issue_info['sp'] if issue_info['sp'] else '-'
+                    result_text += f"| {issue_info['key']} | {sp} | {issue_info['status']} | {issue_info['summary']} |\n"
+                result_text += "\n"
 
             return [TextContent(type="text", text=result_text)]
 

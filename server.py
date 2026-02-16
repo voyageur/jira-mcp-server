@@ -1080,6 +1080,21 @@ class JiraMCPServer:
         except Exception as e:
             return [TextContent(type="text", text=f"Error fetching project issues: {str(e)}")]
 
+    def _get_all_sprints(self, board_id: int, state: Optional[str] = None) -> list:
+        """Fetch all sprints from a board, handling pagination."""
+        all_sprints = []
+        start_at = 0
+        max_results = 50
+        while True:
+            batch = self.jira_client.sprints(board_id, startAt=start_at, maxResults=max_results, state=state)
+            if not batch:
+                break
+            all_sprints.extend(batch)
+            if len(batch) < max_results:
+                break
+            start_at += len(batch)
+        return all_sprints
+
     async def _set_sprint(self, issue_key: str, sprint_option: str,
                          sprint_value: Optional[str] = None, board_id: Optional[int] = None) -> List[TextContent]:
         """Set the sprint for a Jira issue"""
@@ -1130,9 +1145,9 @@ class JiraMCPServer:
                 except Exception as e:
                     return [TextContent(type="text", text=f"Error finding board: {str(e)}")]
 
-            # Get sprints from the board
+            # Get sprints from the board (paginated)
             try:
-                sprints = self.jira_client.sprints(board_id)
+                sprints = self._get_all_sprints(board_id)
             except Exception as e:
                 return [TextContent(type="text", text=f"Error fetching sprints: {str(e)}")]
 
@@ -1392,9 +1407,9 @@ class JiraMCPServer:
             target_sprint = None
 
             if board_id:
-                # Use provided board ID
+                # Use provided board ID (paginated)
                 try:
-                    sprints = self.jira_client.sprints(board_id)
+                    sprints = self._get_all_sprints(board_id)
                     for sprint in sprints:
                         if sprint.name == sprint_name:
                             target_sprint = sprint
@@ -1407,7 +1422,7 @@ class JiraMCPServer:
                     boards = self.jira_client.boards()
                     for board in boards:
                         try:
-                            sprints = self.jira_client.sprints(board.id)
+                            sprints = self._get_all_sprints(board.id)
                             for sprint in sprints:
                                 if sprint.name == sprint_name:
                                     target_sprint = sprint

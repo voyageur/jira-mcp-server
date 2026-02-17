@@ -10,7 +10,9 @@ import asyncio
 import json
 import logging
 import os
+import statistics
 import sys
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Sequence
 
 from dotenv import load_dotenv
@@ -30,6 +32,12 @@ load_dotenv()
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Status categorization for cycle time analysis (case-insensitive matching)
+ACTIVE_STATUSES = {'in progress', 'coding in progress', 'in development', 'in review',
+                   'review', 'code review', 'qa', 'qa in progress', 'testing'}
+DONE_STATUSES = {'closed', 'done', 'resolved', 'verified', 'release pending'}
+BACKLOG_STATUSES = {'new', 'open', 'backlog', 'to do', 'refinement', 'planning'}
 
 class JiraMCPServer:
     def __init__(self):
@@ -380,6 +388,49 @@ class JiraMCPServer:
                         },
                         "required": ["sprint_name"]
                     }
+                ),
+                Tool(
+                    name="get_issue_cycle_time",
+                    description="Get the cycle time and status transition timeline for a single issue. Shows time from first active status (In Progress) to last done status (Closed), with time spent in each status.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "issue_key": {
+                                "type": "string",
+                                "description": "The Jira issue key (e.g., PROJ-123)"
+                            }
+                        },
+                        "required": ["issue_key"]
+                    }
+                ),
+                Tool(
+                    name="analyze_cycle_time",
+                    description="Analyze cycle time statistics for completed issues in a date range or sprint. Shows median, average, 85th percentile cycle times, breakdown by issue type, and flags outliers. Provide either start_date+end_date or sprint_name.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "start_date": {
+                                "type": "string",
+                                "description": "Start date for resolution range (YYYY-MM-DD). Issues resolved on or after this date are included."
+                            },
+                            "end_date": {
+                                "type": "string",
+                                "description": "End date for resolution range (YYYY-MM-DD). Issues resolved before this date are included."
+                            },
+                            "team": {
+                                "type": "string",
+                                "description": "Filter by AssignedTeam value (optional, e.g., 'rhos-connectivity-neutron-gluon')"
+                            },
+                            "sprint_name": {
+                                "type": "string",
+                                "description": "Sprint name to analyze (optional, alternative to date range)"
+                            },
+                            "board_id": {
+                                "type": "integer",
+                                "description": "Board ID (optional, only used with sprint_name)"
+                            }
+                        }
+                    }
                 )
             ]
 
@@ -468,6 +519,16 @@ class JiraMCPServer:
                     return await self._analyze_sprint_scope(
                         arguments["sprint_name"],
                         arguments.get("board_id")
+                    )
+                elif name == "get_issue_cycle_time":
+                    return await self._get_issue_cycle_time(arguments["issue_key"])
+                elif name == "analyze_cycle_time":
+                    return await self._analyze_cycle_time(
+                        start_date=arguments.get("start_date"),
+                        end_date=arguments.get("end_date"),
+                        team=arguments.get("team"),
+                        sprint_name=arguments.get("sprint_name"),
+                        board_id=arguments.get("board_id")
                     )
                 else:
                     return [TextContent(type="text", text=f"Unknown tool: {name}")]
@@ -1080,6 +1141,21 @@ class JiraMCPServer:
         except Exception as e:
             return [TextContent(type="text", text=f"Error fetching project issues: {str(e)}")]
 
+    def _get_all_boards(self) -> list:
+        """Fetch all boards, handling pagination."""
+        all_boards = []
+        start_at = 0
+        max_results = 50
+        while True:
+            batch = self.jira_client.boards(startAt=start_at, maxResults=max_results)
+            if not batch:
+                break
+            all_boards.extend(batch)
+            if len(batch) < max_results:
+                break
+            start_at += len(batch)
+        return all_boards
+
     def _get_all_sprints(self, board_id: int, state: Optional[str] = None) -> list:
         """Fetch all sprints from a board, handling pagination."""
         all_sprints = []
@@ -1355,7 +1431,9 @@ class JiraMCPServer:
             if hasattr(issue, 'changelog') and hasattr(issue.changelog, 'histories'):
                 for history in issue.changelog.histories:
                     created = history.created
-                    author = history.author.displayName if hasattr(history.author, 'displayName') else 'Unknown'
+                    author = 'Unknown'
+                if hasattr(history, 'author') and history.author is not None:
+                    author = getattr(history.author, 'displayName', 'Unknown')
 
                     for item in history.items:
                         if item.field == 'Sprint':
@@ -1397,6 +1475,174 @@ class JiraMCPServer:
         except Exception as e:
             return [TextContent(type="text", text=f"Error fetching sprint history for {issue_key}: {str(e)}")]
 
+    @staticmethod
+    def _categorize_status(status_name: str) -> str:
+        """Categorize a status name into active, done, or backlog"""
+        lower = status_name.lower()
+        if lower in DONE_STATUSES:
+            return 'done'
+        if lower in ACTIVE_STATUSES:
+            return 'active'
+        if lower in BACKLOG_STATUSES:
+            return 'backlog'
+        # Default: treat unknown statuses as active if they're not clearly backlog
+        return 'active'
+
+    @staticmethod
+    def _extract_status_transitions(issue) -> list:
+        """Extract status transitions from an issue's changelog.
+
+        Returns a list of dicts with keys: timestamp, from_status, to_status, author
+        """
+        transitions = []
+        if hasattr(issue, 'changelog') and hasattr(issue.changelog, 'histories'):
+            for history in issue.changelog.histories:
+                created = history.created
+                author = 'Unknown'
+                if hasattr(history, 'author') and history.author is not None:
+                    author = getattr(history.author, 'displayName', 'Unknown')
+                for item in history.items:
+                    if item.field == 'status':
+                        transitions.append({
+                            'timestamp': created,
+                            'from_status': item.fromString or '',
+                            'to_status': item.toString or '',
+                            'author': author
+                        })
+        return transitions
+
+    @staticmethod
+    def _parse_jira_timestamp(ts: str) -> datetime:
+        """Parse a Jira timestamp string into a datetime object"""
+        # Jira timestamps look like: 2026-01-15T10:30:00.000+0000
+        # or 2026-01-15T10:30:00.000+00:00
+        # Strip milliseconds and timezone for simplicity
+        ts_clean = ts.replace('T', ' ')
+        # Handle timezone offset
+        for sep in ['+', '-']:
+            # Find the timezone part (last + or - that's not in the date)
+            parts = ts_clean.rsplit(sep, 1)
+            if len(parts) == 2 and ':' in parts[1] and len(parts[1]) <= 6:
+                ts_clean = parts[0]
+                break
+        # Remove milliseconds
+        if '.' in ts_clean:
+            ts_clean = ts_clean.split('.')[0]
+        return datetime.strptime(ts_clean, '%Y-%m-%d %H:%M:%S')
+
+    @staticmethod
+    def _count_business_days(start: datetime, end: datetime) -> float:
+        """Count business days between two datetimes"""
+        if end <= start:
+            return 0.0
+        # Count full days
+        current = start.date()
+        end_date = end.date()
+        business_days = 0
+        while current <= end_date:
+            if current.weekday() < 5:  # Monday=0 to Friday=4
+                business_days += 1
+            current += timedelta(days=1)
+        # Subtract partial first and last day
+        # If start and end are same day, return fraction of that day
+        if start.date() == end.date():
+            hours = (end - start).total_seconds() / 3600
+            return round(hours / 24, 1) if start.weekday() < 5 else 0.0
+        return float(business_days)
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        """Format seconds into a human-readable duration string"""
+        if seconds < 0:
+            return "0h"
+        total_hours = seconds / 3600
+        if total_hours < 24:
+            return f"{total_hours:.1f}h"
+        days = int(total_hours // 24)
+        hours = int(total_hours % 24)
+        if hours == 0:
+            return f"{days}d"
+        return f"{days}d {hours}h"
+
+    def _calculate_cycle_time(self, transitions: list, created_date: str) -> dict:
+        """Calculate cycle time from status transitions.
+
+        Returns a dict with:
+        - cycle_time_seconds: total elapsed seconds from first active to last done
+        - calendar_days: cycle time in calendar days
+        - business_days: cycle time in business days (weekdays only)
+        - first_active: timestamp of first move to active status
+        - last_done: timestamp of last move to done status
+        - time_in_status: dict mapping status names to seconds spent in each
+        - complete: whether the issue reached a done status
+        """
+        if not transitions:
+            return {'complete': False, 'cycle_time_seconds': 0}
+
+        first_active_ts = None
+        last_done_ts = None
+
+        # Find first transition to an active status
+        for t in transitions:
+            cat = self._categorize_status(t['to_status'])
+            if cat == 'active':
+                first_active_ts = t['timestamp']
+                break
+
+        # Find last transition to a done status
+        for t in reversed(transitions):
+            cat = self._categorize_status(t['to_status'])
+            if cat == 'done':
+                last_done_ts = t['timestamp']
+                break
+
+        # Fallback: if no active transition found, use creation date
+        if not first_active_ts and last_done_ts:
+            first_active_ts = created_date
+
+        if not first_active_ts or not last_done_ts:
+            return {'complete': False, 'cycle_time_seconds': 0}
+
+        start_dt = self._parse_jira_timestamp(first_active_ts)
+        end_dt = self._parse_jira_timestamp(last_done_ts)
+
+        if end_dt <= start_dt:
+            return {'complete': False, 'cycle_time_seconds': 0}
+
+        cycle_seconds = (end_dt - start_dt).total_seconds()
+        calendar_days = round(cycle_seconds / 86400, 1)
+        business_days = self._count_business_days(start_dt, end_dt)
+
+        # Calculate time in each status
+        time_in_status = {}
+        # Build timeline: start from first_active through all transitions
+        prev_status = None
+        prev_ts = None
+        for t in transitions:
+            t_dt = self._parse_jira_timestamp(t['timestamp'])
+            if t_dt < start_dt:
+                prev_status = t['to_status']
+                prev_ts = t_dt
+                continue
+            if prev_status and prev_ts:
+                elapsed = (t_dt - max(prev_ts, start_dt)).total_seconds()
+                if elapsed > 0:
+                    time_in_status[prev_status] = time_in_status.get(prev_status, 0) + elapsed
+            prev_status = t['to_status']
+            prev_ts = t_dt
+            if t_dt >= end_dt:
+                break
+
+        return {
+            'complete': True,
+            'cycle_time_seconds': cycle_seconds,
+            'calendar_days': calendar_days,
+            'business_days': business_days,
+            'first_active': first_active_ts,
+            'last_done': last_done_ts,
+            'time_in_status': time_in_status,
+        }
+
     async def _analyze_sprint_scope(self, sprint_name: str, board_id: Optional[int] = None) -> List[TextContent]:
         """Analyze a sprint using the sprint report API to identify planned vs added issues, punted issues, and calculate predictability"""
         try:
@@ -1419,7 +1665,7 @@ class JiraMCPServer:
             else:
                 # Try to find the sprint across all boards
                 try:
-                    boards = self.jira_client.boards()
+                    boards = self._get_all_boards()
                     for board in boards:
                         try:
                             sprints = self._get_all_sprints(board.id)
@@ -1579,6 +1825,396 @@ class JiraMCPServer:
 
         except Exception as e:
             return [TextContent(type="text", text=f"Error analyzing sprint scope: {str(e)}")]
+
+    async def _get_issue_cycle_time(self, issue_key: str) -> List[TextContent]:
+        """Get cycle time and status transition timeline for a single issue"""
+        try:
+            if not self.jira_client:
+                return [TextContent(type="text", text="Jira client not initialized")]
+
+            # Fetch issue with changelog
+            issue = self.jira_client.issue(issue_key, expand='changelog')
+            created_date = str(issue.fields.created)
+
+            transitions = self._extract_status_transitions(issue)
+
+            if not transitions:
+                return [TextContent(type="text",
+                    text=f"**Cycle Time for {issue_key}**\n\n"
+                         f"No status transitions found in the issue history.\n"
+                         f"Current status: {issue.fields.status.name}")]
+
+            cycle_data = self._calculate_cycle_time(transitions, created_date)
+
+            # Format output
+            result_text = f"**Cycle Time for {issue_key}**\n\n"
+            result_text += f"**Summary:** {issue.fields.summary}\n"
+            result_text += f"**Type:** {issue.fields.issuetype.name}\n"
+            result_text += f"**Current Status:** {issue.fields.status.name}\n\n"
+
+            if cycle_data['complete']:
+                result_text += f"**Cycle Time:** {self._format_duration(cycle_data['cycle_time_seconds'])}\n"
+                result_text += f"**Calendar Days:** {cycle_data['calendar_days']}\n"
+                result_text += f"**Business Days:** {cycle_data['business_days']}\n"
+                result_text += f"**Started:** {cycle_data['first_active']}\n"
+                result_text += f"**Completed:** {cycle_data['last_done']}\n\n"
+
+                # Time in each status
+                time_in_status = cycle_data.get('time_in_status', {})
+                if time_in_status:
+                    result_text += "**Time in Each Status:**\n\n"
+                    result_text += "| Status | Time | Category |\n"
+                    result_text += "|--------|------|----------|\n"
+                    # Sort by time spent descending
+                    sorted_statuses = sorted(time_in_status.items(), key=lambda x: x[1], reverse=True)
+                    for status_name, seconds in sorted_statuses:
+                        category = self._categorize_status(status_name)
+                        result_text += f"| {status_name} | {self._format_duration(seconds)} | {category} |\n"
+                    result_text += "\n"
+            else:
+                result_text += "**Cycle Time:** Not completed (issue has not reached a done status)\n\n"
+
+            # Full transition timeline
+            result_text += "**Status Transition Timeline:**\n\n"
+            for i, t in enumerate(transitions, 1):
+                result_text += f"{i}. **{t['timestamp']}** - {t['from_status']} -> {t['to_status']}\n"
+                result_text += f"   By: {t['author']}\n\n"
+
+            return [TextContent(type="text", text=result_text)]
+
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error fetching cycle time for {issue_key}: {str(e)}")]
+
+    def _get_story_points(self, issue) -> float:
+        """Extract story points from an issue object."""
+        all_fields = self.jira_client.fields()
+        story_point_field = None
+        for field in all_fields:
+            if field.get('name', '').lower() in ['story points', 'story point estimate']:
+                story_point_field = field['id']
+                break
+        if not story_point_field:
+            for candidate in ['customfield_10016', 'customfield_10026', 'customfield_10004']:
+                if hasattr(issue.fields, candidate):
+                    story_point_field = candidate
+                    break
+        if story_point_field and hasattr(issue.fields, story_point_field):
+            sp = getattr(issue.fields, story_point_field)
+            if sp is not None:
+                return float(sp)
+        return 0
+
+    def _find_assigned_team_field(self) -> Optional[str]:
+        """Find the custom field ID for AssignedTeam."""
+        all_fields = self.jira_client.fields()
+        for field in all_fields:
+            field_name = field.get('name', '')
+            field_clauseNames = field.get('clauseNames', [])
+            if field_name == 'Assigned Team' or 'AssignedTeam' in field_clauseNames:
+                return field['id']
+        for field in all_fields:
+            field_name_lower = field.get('name', '').lower()
+            field_id_lower = field.get('id', '').lower()
+            if 'assignedteam' in field_id_lower or 'assigned_team' in field_name_lower or 'assigned team' in field_name_lower:
+                return field['id']
+        return None
+
+    def _fetch_issues_by_date_range(self, start_date: str, end_date: str,
+                                     team: Optional[str] = None) -> list:
+        """Fetch closed issues in a date range using JQL. Returns issue objects with changelog."""
+        jql = f'status = Closed AND resolved >= "{start_date}" AND resolved < "{end_date}"'
+        if team:
+            jql += f' AND AssignedTeam = "{team}"'
+        jql += ' ORDER BY resolved ASC'
+
+        issues = []
+        start_at = 0
+        max_results = 50
+        while True:
+            batch = self.jira_client.search_issues(
+                jql, startAt=start_at, maxResults=max_results, expand='changelog'
+            )
+            if not batch:
+                break
+            issues.extend(batch)
+            if len(batch) < max_results:
+                break
+            start_at += len(batch)
+        return issues
+
+    def _fetch_issues_by_sprint(self, sprint_name: str,
+                                 board_id: Optional[int] = None) -> tuple:
+        """Fetch completed issues from a sprint report. Returns (issues_data, sprint_info) or raises."""
+        target_sprint = None
+
+        if board_id:
+            sprints = self._get_all_sprints(board_id)
+            for sprint in sprints:
+                if sprint.name == sprint_name:
+                    target_sprint = sprint
+                    break
+        else:
+            boards = self._get_all_boards()
+            for board in boards:
+                try:
+                    sprints = self._get_all_sprints(board.id)
+                    for sprint in sprints:
+                        if sprint.name == sprint_name:
+                            target_sprint = sprint
+                            board_id = board.id
+                            break
+                    if target_sprint:
+                        break
+                except:
+                    continue
+
+        if not target_sprint:
+            raise ValueError(f"Sprint '{sprint_name}' not found")
+
+        report_url = f"{self.jira_client.server_url}/rest/greenhopper/1.0/rapid/charts/sprintreport?rapidViewId={board_id}&sprintId={target_sprint.id}"
+        response = self.jira_client._session.get(report_url)
+        response.raise_for_status()
+        report = response.json()
+
+        contents = report.get('contents', {})
+        completed_issues_data = contents.get('completedIssues', [])
+        return completed_issues_data, target_sprint
+
+    async def _analyze_cycle_time(self, start_date: Optional[str] = None,
+                                   end_date: Optional[str] = None,
+                                   team: Optional[str] = None,
+                                   sprint_name: Optional[str] = None,
+                                   board_id: Optional[int] = None) -> List[TextContent]:
+        """Analyze cycle time statistics for completed issues in a date range or sprint."""
+        try:
+            if not self.jira_client:
+                return [TextContent(type="text", text="Jira client not initialized")]
+
+            # Validate inputs
+            use_date_range = bool(start_date and end_date)
+            use_sprint = bool(sprint_name)
+
+            if not use_date_range and not use_sprint:
+                return [TextContent(type="text",
+                    text="Error: Provide either start_date + end_date, or sprint_name")]
+
+            # Build title for output
+            if use_date_range:
+                title = f"{start_date} to {end_date}"
+                if team:
+                    title += f" ({team})"
+            else:
+                title = sprint_name
+
+            # Collect issues and calculate cycle times
+            cycle_results = []
+            skipped_no_transitions = 0
+            skipped_team_filter = 0
+            sprint_info_text = ""
+
+            if use_date_range:
+                # Date range mode: JQL search (team filter applied in JQL)
+                issues = self._fetch_issues_by_date_range(start_date, end_date, team)
+                if not issues:
+                    return [TextContent(type="text",
+                        text=f"**Cycle Time Analysis: {title}**\n\nNo closed issues found in this date range.")]
+
+                for issue in issues:
+                    created_date = str(issue.fields.created)
+                    transitions = self._extract_status_transitions(issue)
+                    if not transitions:
+                        skipped_no_transitions += 1
+                        continue
+
+                    cycle_data = self._calculate_cycle_time(transitions, created_date)
+                    if not cycle_data['complete']:
+                        skipped_no_transitions += 1
+                        continue
+
+                    sp = self._get_story_points(issue)
+                    summary = str(issue.fields.summary or '')
+                    if len(summary) > 50:
+                        summary = summary[:47] + '...'
+
+                    cycle_results.append({
+                        'key': issue.key,
+                        'summary': summary,
+                        'type': issue.fields.issuetype.name,
+                        'sp': sp,
+                        'cycle_days': cycle_data['calendar_days'],
+                        'business_days': cycle_data['business_days'],
+                        'cycle_seconds': cycle_data['cycle_time_seconds'],
+                        'time_in_status': cycle_data.get('time_in_status', {}),
+                    })
+
+                sprint_info_text = f"**Period:** {start_date} to {end_date}\n"
+
+            else:
+                # Sprint mode: use sprint report API
+                try:
+                    completed_issues_data, target_sprint = self._fetch_issues_by_sprint(
+                        sprint_name, board_id)
+                except ValueError as e:
+                    return [TextContent(type="text", text=f"Error: {str(e)}")]
+                except Exception as e:
+                    return [TextContent(type="text", text=f"Error fetching sprint report: {str(e)}")]
+
+                if not completed_issues_data:
+                    return [TextContent(type="text",
+                        text=f"**Cycle Time Analysis: {title}**\n\nNo completed issues found in this sprint.")]
+
+                # Find team field for filtering
+                assigned_team_field = self._find_assigned_team_field() if team else None
+
+                for issue_data in completed_issues_data:
+                    issue_key = issue_data.get('key', '')
+                    if not issue_key:
+                        continue
+
+                    try:
+                        issue = self.jira_client.issue(issue_key, expand='changelog')
+                    except Exception:
+                        continue
+
+                    # Apply team filter
+                    if team and assigned_team_field:
+                        issue_team = getattr(issue.fields, assigned_team_field, None)
+                        if issue_team:
+                            team_name = issue_team.value if hasattr(issue_team, 'value') else str(issue_team)
+                            if team_name != team:
+                                skipped_team_filter += 1
+                                continue
+                        else:
+                            skipped_team_filter += 1
+                            continue
+
+                    created_date = str(issue.fields.created)
+                    transitions = self._extract_status_transitions(issue)
+                    if not transitions:
+                        skipped_no_transitions += 1
+                        continue
+
+                    cycle_data = self._calculate_cycle_time(transitions, created_date)
+                    if not cycle_data['complete']:
+                        skipped_no_transitions += 1
+                        continue
+
+                    sp = 0
+                    stat = issue_data.get('currentEstimateStatistic', {})
+                    val = stat.get('statFieldValue', {})
+                    sp = val.get('value', 0) or 0
+
+                    summary = issue_data.get('summary', issue.fields.summary or '')
+                    if len(summary) > 50:
+                        summary = summary[:47] + '...'
+
+                    cycle_results.append({
+                        'key': issue_key,
+                        'summary': summary,
+                        'type': issue.fields.issuetype.name,
+                        'sp': sp,
+                        'cycle_days': cycle_data['calendar_days'],
+                        'business_days': cycle_data['business_days'],
+                        'cycle_seconds': cycle_data['cycle_time_seconds'],
+                        'time_in_status': cycle_data.get('time_in_status', {}),
+                    })
+
+                sprint_state = getattr(target_sprint, 'state', 'unknown')
+                sprint_start = getattr(target_sprint, 'startDate', None)
+                sprint_end = getattr(target_sprint, 'endDate', None)
+                sprint_start_str = str(sprint_start)[:10] if sprint_start else 'Unknown'
+                sprint_end_str = str(sprint_end)[:10] if sprint_end else 'Unknown'
+                sprint_info_text = f"**Sprint:** {sprint_start_str} to {sprint_end_str} ({sprint_state})\n"
+
+            if not cycle_results:
+                msg = f"**Cycle Time Analysis: {title}**\n\nNo completed issues with valid cycle time data."
+                if skipped_no_transitions:
+                    msg += f"\n{skipped_no_transitions} issue(s) skipped (no status transitions)."
+                if skipped_team_filter:
+                    msg += f"\n{skipped_team_filter} issue(s) filtered out by team filter."
+                return [TextContent(type="text", text=msg)]
+
+            # Calculate statistics
+            cycle_days_list = [r['cycle_days'] for r in cycle_results]
+            business_days_list = [r['business_days'] for r in cycle_results]
+
+            median_days = round(statistics.median(cycle_days_list), 1)
+            avg_days = round(statistics.mean(cycle_days_list), 1)
+            p85_days = round(sorted(cycle_days_list)[int(len(cycle_days_list) * 0.85)], 1) if len(cycle_days_list) > 1 else cycle_days_list[0]
+            median_bdays = round(statistics.median(business_days_list), 1)
+
+            # Sort by cycle time descending
+            cycle_results.sort(key=lambda x: x['cycle_seconds'], reverse=True)
+
+            # Identify outliers (> 2x median)
+            outlier_threshold = median_days * 2
+            outliers = [r for r in cycle_results if r['cycle_days'] > outlier_threshold]
+
+            # Breakdown by issue type
+            type_stats = {}
+            for r in cycle_results:
+                t = r['type']
+                if t not in type_stats:
+                    type_stats[t] = []
+                type_stats[t].append(r['cycle_days'])
+
+            # Format output
+            result_text = f"**Cycle Time Analysis: {title}**\n\n"
+            result_text += sprint_info_text
+            result_text += f"**Completed Issues Analyzed:** {len(cycle_results)}\n"
+            if team:
+                result_text += f"**Team Filter:** {team}\n"
+            if skipped_no_transitions:
+                result_text += f"**Skipped (no transitions):** {skipped_no_transitions}\n"
+            if skipped_team_filter:
+                result_text += f"**Filtered out (team):** {skipped_team_filter}\n"
+            result_text += "\n"
+
+            result_text += "**Cycle Time Statistics (calendar days):**\n"
+            result_text += f"  - Median: **{median_days} days**\n"
+            result_text += f"  - Average: {avg_days} days\n"
+            result_text += f"  - 85th Percentile: {p85_days} days\n"
+            result_text += f"  - Median (business days): {median_bdays} days\n\n"
+
+            # Breakdown by type
+            if len(type_stats) > 1:
+                result_text += "**Breakdown by Issue Type:**\n\n"
+                result_text += "| Type | Count | Median | Average |\n"
+                result_text += "|------|-------|--------|---------|\n"
+                for itype, days_list in sorted(type_stats.items()):
+                    count = len(days_list)
+                    t_median = round(statistics.median(days_list), 1)
+                    t_avg = round(statistics.mean(days_list), 1)
+                    result_text += f"| {itype} | {count} | {t_median}d | {t_avg}d |\n"
+                result_text += "\n"
+
+            # Per-issue table
+            result_text += "**Per-Issue Cycle Times:**\n\n"
+            result_text += "| Issue | Type | SP | Cycle (cal) | Cycle (biz) | Summary |\n"
+            result_text += "|-------|------|----|-------------|-------------|---------|\n"
+            for r in cycle_results:
+                sp = r['sp'] if r['sp'] else '-'
+                flag = " **" if r['cycle_days'] > outlier_threshold else ""
+                flag_end = "**" if flag else ""
+                result_text += f"| {r['key']} | {r['type']} | {sp} | {flag}{r['cycle_days']}d{flag_end} | {r['business_days']}d | {r['summary']} |\n"
+            result_text += "\n"
+
+            # Outliers section
+            if outliers:
+                result_text += f"**Outliers (>{outlier_threshold} days, >2x median):**\n\n"
+                for r in outliers:
+                    result_text += f"- **{r['key']}** ({r['cycle_days']} days): {r['summary']}\n"
+                    tis = r.get('time_in_status', {})
+                    if tis:
+                        sorted_tis = sorted(tis.items(), key=lambda x: x[1], reverse=True)
+                        status_parts = [f"{name}: {self._format_duration(secs)}" for name, secs in sorted_tis[:3]]
+                        result_text += f"  Top statuses: {', '.join(status_parts)}\n"
+                result_text += "\n"
+
+            return [TextContent(type="text", text=result_text)]
+
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error analyzing cycle time: {str(e)}")]
 
     async def run(self):
         """Run the MCP server"""

@@ -4,7 +4,7 @@ A clean and focused Model Context Protocol (MCP) server that provides seamless i
 
 ## 🎯 Features
 
-- **11 Comprehensive Tools** for full Jira interaction
+- **19 Comprehensive Tools** for full Jira interaction
 - **Natural Language Interface** - Ask AI to manage your Jira work
 - **Real-time Updates** - Get current project status and issue information
 - **Secure Authentication** - API token-based authentication
@@ -26,6 +26,14 @@ A clean and focused Model Context Protocol (MCP) server that provides seamless i
 | `get_issue_types` | Get available types | `get_issue_types(project_key="PROJ")` |
 | `get_my_issues` | Get assigned issues | `get_my_issues(max_results=20)` |
 | `get_project_issues` | Get project issues | `get_project_issues(project_key="PROJ")` |
+| `set_sprint` | Set or remove sprint assignment | `set_sprint(issue_key="PROJ-123", sprint_option="current")` |
+| `set_epic_link` | Set or remove epic link | `set_epic_link(issue_key="PROJ-123", epic_key="PROJ-100")` |
+| `get_components` | Get available components | `get_components(project_key="PROJ")` |
+| `set_components` | Set components for an issue | `set_components(issue_key="PROJ-123", components=["Backend"])` |
+| `get_issue_sprint_history` | Get sprint change history | `get_issue_sprint_history(issue_key="PROJ-123")` |
+| `analyze_sprint_scope` | Analyze sprint predictability | `analyze_sprint_scope(sprint_name="Sprint 5")` |
+| `get_issue_cycle_time` | Get cycle time for an issue | `get_issue_cycle_time(issue_key="PROJ-123")` |
+| `analyze_cycle_time` | Analyze cycle time statistics | `analyze_cycle_time(start_date="2026-01-01", end_date="2026-02-01")` |
 
 ## 🚀 Quick Start (5 minutes)
 
@@ -353,6 +361,10 @@ Your Jira MCP server is now properly configured and ready to use! You can:
 - ✅ Manage comments and transitions
 - ✅ Get project information
 - ✅ Handle your assigned work
+- ✅ Manage sprints and epic links
+- ✅ Manage components
+- ✅ Analyze sprint scope and predictability
+- ✅ Analyze cycle time metrics
 
 The server provides a powerful interface between AI assistants and your Jira workflow, making it easier to manage projects and track progress.
 

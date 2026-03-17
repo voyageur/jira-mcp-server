@@ -39,10 +39,19 @@ ACTIVE_STATUSES = {'in progress', 'coding in progress', 'in development', 'in re
 DONE_STATUSES = {'closed', 'done', 'resolved', 'verified', 'release pending'}
 BACKLOG_STATUSES = {'new', 'open', 'backlog', 'to do', 'refinement', 'planning'}
 
+# Tools that are always available (analytics-only mode)
+ANALYTICS_TOOLS = {
+    'get_issue_sprint_history', 'analyze_sprint_scope',
+    'get_issue_cycle_time', 'analyze_cycle_time'
+}
+
 class JiraMCPServer:
     def __init__(self):
         self.server = Server("jira-mcp-server")
         self.jira_client: Optional[JIRA] = None
+        self.analytics_only = os.getenv("JIRA_ANALYTICS_MODE", "full").lower() == "analytics-only"
+        if self.analytics_only:
+            logger.info("Running in analytics-only mode (basic tools disabled)")
         self._setup_tools()
         
     def _setup_tools(self):
@@ -51,7 +60,7 @@ class JiraMCPServer:
         @self.server.list_tools()
         async def list_tools() -> List[Tool]:
             """List all available Jira tools"""
-            return [
+            all_tools = [
                 Tool(
                     name="get_issue",
                     description="Get detailed information about a specific Jira issue",
@@ -434,6 +443,10 @@ class JiraMCPServer:
                 )
             ]
 
+            if self.analytics_only:
+                return [t for t in all_tools if t.name in ANALYTICS_TOOLS]
+            return all_tools
+
         @self.server.call_tool()
         async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
             """Handle tool calls"""
@@ -442,6 +455,10 @@ class JiraMCPServer:
             if not self.jira_client:
                 await self._init_jira_client()
             
+            # Block non-analytics tools in analytics-only mode
+            if self.analytics_only and name not in ANALYTICS_TOOLS:
+                return [TextContent(type="text", text=f"Tool '{name}' is not available in analytics-only mode. Set JIRA_ANALYTICS_MODE=full to enable all tools.")]
+
             try:
                 if name == "get_issue":
                     return await self._get_issue(arguments["issue_key"])

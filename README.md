@@ -35,6 +35,43 @@ A clean and focused Model Context Protocol (MCP) server that provides seamless i
 | `get_issue_cycle_time` | Get cycle time for an issue | `get_issue_cycle_time(issue_key="PROJ-123")` |
 | `analyze_cycle_time` | Analyze cycle time statistics | `analyze_cycle_time(start_date="2026-01-01", end_date="2026-02-01")` |
 
+## Operating Modes
+
+The server supports two operating modes, controlled by the `JIRA_ANALYTICS_MODE` environment variable:
+
+| Mode | Value | Tools Available | Use Case |
+|------|-------|----------------|----------|
+| **Full** (default) | `full` | All 19 tools | Standalone usage — the server handles all Jira operations |
+| **Analytics-only** | `analytics-only` | 4 analytics tools | Running alongside `mcp-atlassian` — basic CRUD is handled by the Atlassian MCP server, this server provides sprint and cycle time analytics |
+
+### Analytics-only tools
+
+These tools are unique to this server and not available in `mcp-atlassian`:
+
+| Tool | Description |
+|------|-------------|
+| `get_issue_sprint_history` | Sprint movement history for an issue |
+| `analyze_sprint_scope` | Sprint predictability with planned/added/punted breakdown |
+| `get_issue_cycle_time` | Single issue status transition timeline and cycle time |
+| `analyze_cycle_time` | Aggregate cycle time statistics (median, p85, outliers) |
+
+### Configuration
+
+```bash
+# Default: all tools enabled (standalone mode)
+JIRA_ANALYTICS_MODE=full
+
+# Analytics-only: use alongside mcp-atlassian
+JIRA_ANALYTICS_MODE=analytics-only
+```
+
+### Using with mcp-atlassian
+
+When running alongside the [mcp-atlassian](https://github.com/sooperset/mcp-atlassian) MCP server, set `JIRA_ANALYTICS_MODE=analytics-only` to avoid duplicate tools. Both servers use the same Jira credentials but serve complementary purposes:
+
+- **mcp-atlassian**: Issue CRUD, search, transitions, agile boards, Confluence
+- **jira-mcp-server** (analytics-only): Sprint scope analysis, cycle time metrics
+
 ## 🚀 Quick Start (5 minutes)
 
 ### Prerequisites

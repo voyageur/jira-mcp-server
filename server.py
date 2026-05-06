@@ -42,7 +42,8 @@ BACKLOG_STATUSES = {'new', 'open', 'backlog', 'to do', 'refinement', 'planning'}
 # Tools that are always available (analytics-only mode)
 ANALYTICS_TOOLS = {
     'get_issue_sprint_history', 'analyze_sprint_scope',
-    'get_issue_cycle_time', 'analyze_cycle_time'
+    'get_issue_cycle_time', 'analyze_cycle_time',
+    'analyze_wip', 'analyze_throughput', 'analyze_backlog'
 }
 
 class JiraMCPServer:
@@ -443,6 +444,85 @@ class JiraMCPServer:
                 )
             ]
 
+            all_tools.extend([
+                Tool(
+                    name="analyze_wip",
+                    description=(
+                        "Analyze current Work In Progress (WIP) with age classification. "
+                        "Shows active (<60d), borderline (60-120d), and zombie (>120d) items "
+                        "per person. Useful for identifying stale work and WIP overload."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "team": {
+                                "type": "string",
+                                "description": "Filter by AssignedTeam value (optional)"
+                            },
+                            "zombie_days": {
+                                "type": "integer",
+                                "description": "Days threshold for zombie classification (default 120)"
+                            }
+                        }
+                    }
+                ),
+                Tool(
+                    name="analyze_throughput",
+                    description=(
+                        "Analyze delivery throughput — closures per 2-week period, classified as "
+                        "sprint work (<30d cycle time) or stale (>=30d backlog cleanup). "
+                        "Shows work-per-week rate and stale ratio."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "start_date": {
+                                "type": "string",
+                                "description": "Start date (YYYY-MM-DD)"
+                            },
+                            "end_date": {
+                                "type": "string",
+                                "description": "End date (YYYY-MM-DD)"
+                            },
+                            "team": {
+                                "type": "string",
+                                "description": "Filter by AssignedTeam value (optional)"
+                            },
+                            "stale_threshold": {
+                                "type": "integer",
+                                "description": "Days cycle time above which closure is stale (default 30)"
+                            }
+                        },
+                        "required": ["start_date", "end_date"]
+                    }
+                ),
+                Tool(
+                    name="analyze_backlog",
+                    description=(
+                        "Analyze backlog health — current status distribution (New, Backlog, "
+                        "Refinement, To Do) and growth rate (created vs closed per period). "
+                        "Shows whether backlog is growing or shrinking."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "team": {
+                                "type": "string",
+                                "description": "Filter by AssignedTeam value (optional)"
+                            },
+                            "start_date": {
+                                "type": "string",
+                                "description": "Start date for growth trend (YYYY-MM-DD, optional)"
+                            },
+                            "end_date": {
+                                "type": "string",
+                                "description": "End date for growth trend (YYYY-MM-DD, optional)"
+                            }
+                        }
+                    }
+                ),
+            ])
+
             if self.analytics_only:
                 return [t for t in all_tools if t.name in ANALYTICS_TOOLS]
             return all_tools
@@ -546,6 +626,24 @@ class JiraMCPServer:
                         team=arguments.get("team"),
                         sprint_name=arguments.get("sprint_name"),
                         board_id=arguments.get("board_id")
+                    )
+                elif name == "analyze_wip":
+                    return await self._analyze_wip(
+                        team=arguments.get("team"),
+                        zombie_days=arguments.get("zombie_days", 120)
+                    )
+                elif name == "analyze_throughput":
+                    return await self._analyze_throughput(
+                        start_date=arguments["start_date"],
+                        end_date=arguments["end_date"],
+                        team=arguments.get("team"),
+                        stale_threshold=arguments.get("stale_threshold", 30)
+                    )
+                elif name == "analyze_backlog":
+                    return await self._analyze_backlog(
+                        team=arguments.get("team"),
+                        start_date=arguments.get("start_date"),
+                        end_date=arguments.get("end_date")
                     )
                 else:
                     return [TextContent(type="text", text=f"Unknown tool: {name}")]
@@ -2239,6 +2337,242 @@ class JiraMCPServer:
 
         except Exception as e:
             return [TextContent(type="text", text=f"Error analyzing cycle time: {str(e)}")]
+
+    # ------------------------------------------------------------------
+    # WIP, Throughput, and Backlog analysis tools
+    # ------------------------------------------------------------------
+
+    async def _analyze_wip(self, team: Optional[str] = None,
+                           zombie_days: int = 120) -> List[TextContent]:
+        """Analyze current Work In Progress with age classification."""
+        try:
+            stale_days = 60
+            status_list = ', '.join(f'"{s.title()}"' for s in sorted(ACTIVE_STATUSES))
+            jql = f'status in ({status_list}) AND type NOT IN (Epic, Feature)'
+            if team:
+                jql += f' AND AssignedTeam = "{team}"'
+            jql += ' ORDER BY updated ASC'
+
+            logger.info(f"WIP: searching with JQL: {jql}")
+            issues = self.jira_client.search_issues(jql, maxResults=500)
+
+            now = datetime.now()
+            by_person: Dict[str, Dict[str, list]] = {}
+            totals = {'active': 0, 'borderline': 0, 'zombie': 0}
+            zombie_items = []
+
+            for issue in issues:
+                updated_str = str(issue.fields.updated)[:10]
+                try:
+                    updated_dt = datetime.strptime(updated_str, '%Y-%m-%d')
+                except ValueError:
+                    updated_dt = now
+                days_since = (now - updated_dt).days
+
+                if days_since >= zombie_days:
+                    category = 'zombie'
+                elif days_since >= stale_days:
+                    category = 'borderline'
+                else:
+                    category = 'active'
+                totals[category] += 1
+
+                assignee = 'Unassigned'
+                if issue.fields.assignee:
+                    assignee = getattr(issue.fields.assignee, 'displayName', str(issue.fields.assignee))
+
+                if assignee not in by_person:
+                    by_person[assignee] = {'active': 0, 'borderline': 0, 'zombie': 0}
+                by_person[assignee][category] += 1
+
+                if category == 'zombie':
+                    summary = str(issue.fields.summary)[:60]
+                    zombie_items.append(f"- {issue.key} ({assignee}, {days_since}d): {summary}")
+
+            total = sum(totals.values())
+            team_label = team or "all teams"
+            lines = [
+                f"**WIP Analysis: {team_label}** (snapshot {now.strftime('%Y-%m-%d')})\n",
+                f"**Total:** {total} items ({totals['active']} active, "
+                f"{totals['borderline']} borderline, {totals['zombie']} zombie)\n",
+            ]
+
+            if by_person:
+                lines.append("**Per Person:**\n")
+                lines.append("| Assignee | Active | Borderline | Zombie | Total |")
+                lines.append("|----------|--------|------------|--------|-------|")
+                for name in sorted(by_person.keys()):
+                    c = by_person[name]
+                    person_total = sum(c.values())
+                    lines.append(f"| {name} | {c['active']} | {c['borderline']} | {c['zombie']} | {person_total} |")
+
+            if zombie_items:
+                lines.append(f"\n**Zombie Items (>{zombie_days} days):**\n")
+                lines.extend(zombie_items)
+
+            return [TextContent(type="text", text="\n".join(lines))]
+
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error analyzing WIP: {str(e)}")]
+
+    async def _analyze_throughput(self, start_date: str, end_date: str,
+                                  team: Optional[str] = None,
+                                  stale_threshold: int = 30) -> List[TextContent]:
+        """Analyze delivery throughput — closures per period with stale classification."""
+        try:
+            jql = (
+                f'status = Closed AND resolved >= "{start_date}" '
+                f'AND resolved < "{end_date}" AND type NOT IN (Epic, Feature)'
+            )
+            if team:
+                jql += f' AND AssignedTeam = "{team}"'
+            jql += ' ORDER BY resolved ASC'
+
+            logger.info(f"Throughput: searching with JQL: {jql}")
+            issues = self.jira_client.search_issues(jql, maxResults=500, expand='changelog')
+
+            # Classify each issue
+            classified = []
+            for issue in issues:
+                created_date = str(issue.fields.created)
+                transitions = self._extract_status_transitions(issue)
+                cycle_data = self._calculate_cycle_time(transitions, created_date)
+                cycle_days = cycle_data.get('calendar_days') if cycle_data.get('complete') else None
+
+                resolved_str = str(issue.fields.resolutiondate or issue.fields.updated)[:10]
+                try:
+                    resolved_dt = datetime.strptime(resolved_str, '%Y-%m-%d')
+                except ValueError:
+                    continue
+
+                classified.append({
+                    'resolved_date': resolved_dt,
+                    'cycle_days': cycle_days,
+                    'is_stale': cycle_days is not None and cycle_days >= stale_threshold,
+                })
+
+            # Group into 2-week periods
+            start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+            end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+            period_rows = []
+            total_sprint_work = 0
+            total_stale = 0
+
+            current = start_dt
+            while current < end_dt:
+                period_end = min(current + timedelta(days=14), end_dt)
+                period_issues = [
+                    c for c in classified
+                    if current <= c['resolved_date'] < period_end
+                ]
+                stale = sum(1 for c in period_issues if c['is_stale'])
+                sprint_work = len(period_issues) - stale
+                weeks = (period_end - current).days / 7.0
+                total_sprint_work += sprint_work
+                total_stale += stale
+
+                period_rows.append({
+                    'start': current.strftime('%Y-%m-%d'),
+                    'end': period_end.strftime('%Y-%m-%d'),
+                    'total': len(period_issues),
+                    'sprint_work': sprint_work,
+                    'stale': stale,
+                    'work_per_week': round(sprint_work / weeks, 1) if weeks > 0 else 0,
+                })
+                current = period_end
+
+            team_label = team or "all teams"
+            total_all = total_sprint_work + total_stale
+            stale_pct = round(total_stale / total_all * 100, 1) if total_all > 0 else 0
+
+            lines = [
+                f"**Throughput Analysis: {start_date} to {end_date}** ({team_label})\n",
+                f"**Overall:** {total_all} closed ({total_sprint_work} sprint work, "
+                f"{total_stale} stale, {stale_pct}% stale ratio)\n",
+                "| Period | Total | Sprint Work | Stale | Work/Week |",
+                "|--------|-------|-------------|-------|-----------|",
+            ]
+            for row in period_rows:
+                lines.append(
+                    f"| {row['start']} to {row['end']} | {row['total']} | "
+                    f"{row['sprint_work']} | {row['stale']} | {row['work_per_week']} |"
+                )
+
+            return [TextContent(type="text", text="\n".join(lines))]
+
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error analyzing throughput: {str(e)}")]
+
+    async def _analyze_backlog(self, team: Optional[str] = None,
+                               start_date: Optional[str] = None,
+                               end_date: Optional[str] = None) -> List[TextContent]:
+        """Analyze backlog health — status distribution and growth rate."""
+        try:
+            team_label = team or "all teams"
+            team_clause = f' AND AssignedTeam = "{team}"' if team else ''
+            exclude = ' AND type NOT IN (Epic, Feature)'
+            now_str = datetime.now().strftime('%Y-%m-%d')
+
+            # Snapshot: count by backlog status
+            statuses = ['New', 'Backlog', 'Refinement', 'To Do']
+            snapshot = {}
+            for status in statuses:
+                jql = f'status = "{status}"{exclude}{team_clause}'
+                issues = self.jira_client.search_issues(jql, maxResults=500)
+                snapshot[status] = len(issues)
+
+            total_backlog = sum(snapshot.values())
+            lines = [
+                f"**Backlog Analysis: {team_label}**\n",
+                f"**Current Snapshot** ({now_str}):\n",
+                "| Status | Count |",
+                "|--------|-------|",
+            ]
+            for status in statuses:
+                lines.append(f"| {status} | {snapshot[status]} |")
+            lines.append(f"| **Total** | **{total_backlog}** |")
+
+            # Growth trend (if dates provided)
+            if start_date and end_date:
+                start_dt = datetime.strptime(start_date, '%Y-%m-%d')
+                end_dt = datetime.strptime(end_date, '%Y-%m-%d')
+
+                lines.append(f"\n**Growth Trend** ({start_date} to {end_date}):\n")
+                lines.append("| Period | Created | Closed | Net |")
+                lines.append("|--------|---------|--------|-----|")
+
+                total_created = 0
+                total_closed = 0
+                current = start_dt
+                while current < end_dt:
+                    period_end = min(current + timedelta(days=14), end_dt)
+                    ps = current.strftime('%Y-%m-%d')
+                    pe = period_end.strftime('%Y-%m-%d')
+
+                    created_jql = f'created >= "{ps}" AND created < "{pe}"{exclude}{team_clause}'
+                    created_issues = self.jira_client.search_issues(created_jql, maxResults=500)
+                    created = len(created_issues)
+
+                    closed_jql = f'status = Closed AND resolved >= "{ps}" AND resolved < "{pe}"{exclude}{team_clause}'
+                    closed_issues = self.jira_client.search_issues(closed_jql, maxResults=500)
+                    closed = len(closed_issues)
+
+                    net = created - closed
+                    total_created += created
+                    total_closed += closed
+                    net_sign = "+" if net > 0 else ""
+                    lines.append(f"| {ps} to {pe} | {created} | {closed} | {net_sign}{net} |")
+
+                    current = period_end
+
+                total_net = total_created - total_closed
+                net_sign = "+" if total_net > 0 else ""
+                lines.append(f"| **Total** | **{total_created}** | **{total_closed}** | **{net_sign}{total_net}** |")
+
+            return [TextContent(type="text", text="\n".join(lines))]
+
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error analyzing backlog: {str(e)}")]
 
     async def run(self):
         """Run the MCP server"""

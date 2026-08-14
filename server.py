@@ -2049,20 +2049,13 @@ class JiraMCPServer:
             jql += f' AND AssignedTeam = "{team}"'
         jql += ' ORDER BY resolved ASC'
 
-        issues = []
-        start_at = 0
-        max_results = 50
-        while True:
-            batch = self.jira_client.search_issues(
-                jql, startAt=start_at, maxResults=max_results, expand='changelog'
-            )
-            if not batch:
-                break
-            issues.extend(batch)
-            if len(batch) < max_results:
-                break
-            start_at += len(batch)
-        return issues
+        # maxResults=False makes the jira library fetch every page itself
+        # (following nextPageToken / batching startAt internally) instead of
+        # us incrementing startAt manually. That matters because Jira Cloud
+        # (jira>=3.10.0) raises JIRAError ("search API is deprecated") on any
+        # call with startAt != 0 — exactly what the old manual loop here did
+        # on its second page onward.
+        return self.jira_client.search_issues(jql, maxResults=False, expand='changelog')
 
     def _fetch_issues_by_sprint(self, sprint_name: str,
                                  board_id: Optional[int] = None) -> tuple:
@@ -2354,7 +2347,9 @@ class JiraMCPServer:
             jql += ' ORDER BY updated ASC'
 
             logger.info(f"WIP: searching with JQL: {jql}")
-            issues = self.jira_client.search_issues(jql, maxResults=500)
+            # maxResults=False: fetch all pages (see _fetch_issues_by_date_range
+            # for why a truthy maxResults silently truncates to one page).
+            issues = self.jira_client.search_issues(jql, maxResults=False)
 
             now = datetime.now()
             by_person: Dict[str, Dict[str, list]] = {}
@@ -2429,7 +2424,9 @@ class JiraMCPServer:
             jql += ' ORDER BY resolved ASC'
 
             logger.info(f"Throughput: searching with JQL: {jql}")
-            issues = self.jira_client.search_issues(jql, maxResults=500, expand='changelog')
+            # maxResults=False: fetch all pages (see _fetch_issues_by_date_range
+            # for why a truthy maxResults silently truncates to one page).
+            issues = self.jira_client.search_issues(jql, maxResults=False, expand='changelog')
 
             # Classify each issue
             classified = []
@@ -2518,7 +2515,9 @@ class JiraMCPServer:
             snapshot = {}
             for status in statuses:
                 jql = f'status = "{status}"{exclude}{team_clause}'
-                issues = self.jira_client.search_issues(jql, maxResults=500)
+                # maxResults=False: fetch all pages (see _fetch_issues_by_date_range
+                # for why a truthy maxResults silently truncates to one page).
+                issues = self.jira_client.search_issues(jql, maxResults=False)
                 snapshot[status] = len(issues)
 
             total_backlog = sum(snapshot.values())
@@ -2549,12 +2548,14 @@ class JiraMCPServer:
                     ps = current.strftime('%Y-%m-%d')
                     pe = period_end.strftime('%Y-%m-%d')
 
+                    # maxResults=False: fetch all pages (see _fetch_issues_by_date_range
+                    # for why a truthy maxResults silently truncates to one page).
                     created_jql = f'created >= "{ps}" AND created < "{pe}"{exclude}{team_clause}'
-                    created_issues = self.jira_client.search_issues(created_jql, maxResults=500)
+                    created_issues = self.jira_client.search_issues(created_jql, maxResults=False)
                     created = len(created_issues)
 
                     closed_jql = f'status = Closed AND resolved >= "{ps}" AND resolved < "{pe}"{exclude}{team_clause}'
-                    closed_issues = self.jira_client.search_issues(closed_jql, maxResults=500)
+                    closed_issues = self.jira_client.search_issues(closed_jql, maxResults=False)
                     closed = len(closed_issues)
 
                     net = created - closed

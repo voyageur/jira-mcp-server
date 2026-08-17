@@ -1,5 +1,25 @@
 # Jira MCP Server
 
+> **⚠️ DEPRECATED (2026-08):** This server's `analytics-only` mode
+> (`get_issue_sprint_history`, `analyze_sprint_scope`, `get_issue_cycle_time`,
+> `analyze_cycle_time`, `analyze_wip`, `analyze_throughput`,
+> `analyze_backlog`) has been retired and replaced by:
+>
+> - **[mcp-atlassian](https://github.com/sooperset/mcp-atlassian)** for all
+>   Jira/Confluence data access (issue CRUD, search, agile boards,
+>   changelogs) — the same server already used for everything else, so
+>   there's no longer a second Jira credential that can drift out of sync.
+> - A **`sprint-analysis` replacement skill** can handle the remaining tools via
+>   `mcp-atlassian` call patterns and ship two bundled, stdlib-only Python
+>   scripts (`scripts/flow_metrics.py`, `scripts/sprint_scope.py`) that
+>   compute the same cycle time, WIP, throughput, and sprint-scope/
+>   predictability metrics deterministically from data already fetched via
+>   `mcp-atlassian` — no separate MCP server or Jira token required.
+>
+> This repository is no longer actively maintained. The `full` mode tools
+> (issue CRUD, comments, transitions, etc.) are also fully covered by
+> `mcp-atlassian` and are not a reason to keep running this server either.
+
 A clean and focused Model Context Protocol (MCP) server that provides seamless integration between AI assistants and Jira, enabling natural language interaction with your Jira projects, issues, and workflows.
 
 ## 🎯 Features
@@ -414,4 +434,4 @@ Once it's working, you can:
 - Add comments: "Add a comment to PROJ-456 saying testing is complete"
 - Transition issues: "Move PROJ-789 to Done"
 
-Enjoy your new Jira integration! 🎉 
+Enjoy your new Jira integration! 🎉
